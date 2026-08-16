@@ -106,4 +106,4 @@ The checked-in portable fixture under `tests/fixtures/` runs without network acc
 
 ## License
 
-Swatch is licensed under the [Apache License, Version 2.0](LICENSE).
+Use the repository's [security policy](./SECURITY.md) instead of a public issue for suspected vulnerabilities. Swatch is licensed under the [Apache License, Version 2.0](LICENSE).
