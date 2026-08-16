@@ -10,6 +10,8 @@ use std::process::Command;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+const CURSEFORGE_MANIFEST_VERSION: u32 = 1;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Overrides {
@@ -434,7 +436,7 @@ fn manifest_from_lock(
             }],
         },
         manifest_type: "minecraftModpack".into(),
-        manifest_version: 1,
+        manifest_version: CURSEFORGE_MANIFEST_VERSION,
         name: lock.pack.name.clone(),
         version: lock.pack.version.clone(),
         author: author.into(),
@@ -491,6 +493,7 @@ fn toml_string(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::spec::{EnvSpec, FileSpec, PackMeta, SideRequirement};
+    use std::io::Read;
 
     fn lock(mapped: bool) -> Lockfile {
         let file = FileSpec {
@@ -544,7 +547,6 @@ mod tests {
         let json = serde_json::to_value(manifest).expect("manifest JSON");
         assert_eq!(json["files"][0]["projectID"], 123);
         assert_eq!(json["files"][0]["fileID"], 456);
-        assert_eq!(json["manifestVersion"], 1);
         assert!(json["files"][0].get("projectId").is_none());
     }
 
@@ -636,8 +638,12 @@ mod tests {
         fs::write(root.overrides_dir().join("config/common.txt"), b"common").expect("common file");
         fs::write(root.client_overrides_dir().join("client.txt"), b"client").expect("client file");
         fs::write(root.server_overrides_dir().join("server.txt"), b"server").expect("server file");
+        let manifest =
+            manifest_from_lock(&lock(true), "Example Author", &no_exclusions()).expect("manifest");
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("manifest JSON");
+        manifest_bytes.push(b'\n');
         let destination = temp.path().join("pack.zip");
-        write_archive(&root, &destination, b"{}\n").expect("archive");
+        write_archive(&root, &destination, &manifest_bytes).expect("archive");
 
         let file = File::open(destination).expect("archive file");
         let mut zip = zip::ZipArchive::new(file).expect("zip");
@@ -652,5 +658,13 @@ mod tests {
                 "overrides/config/common.txt"
             ]
         );
+        let mut manifest_json = String::new();
+        zip.by_name("manifest.json")
+            .expect("manifest.json")
+            .read_to_string(&mut manifest_json)
+            .expect("manifest JSON");
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&manifest_json).expect("parsed manifest JSON");
+        assert_eq!(manifest_json["manifestVersion"], 1);
     }
 }

@@ -8,6 +8,8 @@ use std::path::Path;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+const MODRINTH_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize)]
 pub struct MrpackIndex {
     #[serde(rename = "formatVersion")]
@@ -64,7 +66,7 @@ pub fn index_from_lock(lock: &Lockfile) -> Result<MrpackIndex> {
         lock.pack.loader_version.clone(),
     );
     Ok(MrpackIndex {
-        format_version: 1,
+        format_version: MODRINTH_FORMAT_VERSION,
         game: "minecraft".to_string(),
         version_id: lock.pack.version.clone(),
         name: lock.pack.name.clone(),
@@ -129,6 +131,7 @@ fn write_mrpack(dest: &Path, index_bytes: &[u8], root: &PackRoot) -> Result<()> 
 mod tests {
     use super::*;
     use crate::spec::{EnvSpec, FileSpec, PackMeta, SideRequirement};
+    use std::io::Read;
 
     #[test]
     fn index_omits_nothing_and_sorts() {
@@ -174,7 +177,6 @@ mod tests {
             curseforge: Vec::new(),
         };
         let index = index_from_lock(&lock).expect("index");
-        assert_eq!(index.format_version, 1);
         assert_eq!(index.files[0].path, "mods/a.jar");
         assert_eq!(index.files[1].env.server, SideRequirement::Unsupported);
         assert_eq!(
@@ -185,5 +187,22 @@ mod tests {
             index.dependencies.get("fabric-loader").map(String::as_str),
             Some("0.19.3")
         );
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = PackRoot {
+            path: temp.path().into(),
+        };
+        fs::write(root.lock_toml(), lock.to_toml().expect("lock TOML")).expect("lockfile");
+        let archive = export(&root).expect("mrpack");
+        let file = File::open(archive).expect("mrpack file");
+        let mut zip = zip::ZipArchive::new(file).expect("mrpack zip");
+        let mut index_json = String::new();
+        zip.by_name("modrinth.index.json")
+            .expect("modrinth.index.json")
+            .read_to_string(&mut index_json)
+            .expect("index JSON");
+        let index_json: serde_json::Value =
+            serde_json::from_str(&index_json).expect("parsed index JSON");
+        assert_eq!(index_json["formatVersion"], 1);
     }
 }
