@@ -1,0 +1,11 @@
+/target/
+/dist/
+/.cache/
+/generated/
+.DS_Store
+
+/tests/fixtures/portable-pack/dist/
+
+!/tests/fixtures/portable-pack/.cache/
+!/tests/fixtures/portable-pack/.cache/objects/
+!/tests/fixtures/portable-pack/.cache/objects/**

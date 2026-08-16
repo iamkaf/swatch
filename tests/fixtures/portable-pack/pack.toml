@@ -1,0 +1,29 @@
+format = 1
+
+[pack]
+name = "Copper Valley"
+slug = "copper-valley"
+version = "0.1.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "neoforge"
+loader_version = "26.2.0"
+
+[mods]
+shared-fixture = "1.0.0"
+
+[server_mods]
+dedicated-fixture = "2.0.0"
+
+[publish.modrinth]
+project = "copper-valley"
+
+[publish.github]
+repository = "example/copper-valley"
+
+[publish.curseforge]
+project = 123
+author = "Example Author"
+
+[publish.maven]
+repository = "https://example.invalid/maven"

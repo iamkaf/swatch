@@ -1,0 +1,42 @@
+version = 2
+
+[pack]
+name = "Copper Valley"
+slug = "copper-valley"
+version = "0.1.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "neoforge"
+loader_version = "26.2.0"
+
+[[file]]
+id = "dedicated-fixture"
+requested_version = "2.0.0"
+path = "mods/dedicated-fixture.jar"
+file_size = 24
+sha1 = "9eae3a4b364d36807702bcc6d9c3a574604e72c7"
+sha512 = "5b6c71057bd7d3b6b595d0d58ae1d812cefa23acb726eb7c4f3274679fcba1dfe7a3e9b4974f8e2cbfbe06c1a031c63eca70a9b1ddf7738b19cd8ce17db783a3"
+downloads = ["https://example.invalid/dedicated-fixture.jar"]
+
+[file.env]
+client = "unsupported"
+server = "required"
+
+[[file]]
+id = "shared-fixture"
+requested_version = "1.0.0"
+path = "mods/shared-fixture.jar"
+file_size = 24
+sha1 = "b20d33a264288693a26a075a869a72c014493350"
+sha512 = "19b46d17ea6e4c71c679bd2f3d804d6f7fc3f2f04a479e306f811e9b0ed9d4b9b9c6cc042dadda8556295cd46dbfc4c7ff933dbf335555d198340cc9a6da0060"
+downloads = ["https://example.invalid/shared-fixture.jar"]
+
+[file.env]
+client = "required"
+server = "required"
+
+[[curseforge]]
+path = "mods/shared-fixture.jar"
+sha1 = "b20d33a264288693a26a075a869a72c014493350"
+project_id = 123
+file_id = 456
