@@ -434,7 +434,7 @@ fn manifest_from_lock(
             }],
         },
         manifest_type: "minecraftModpack".into(),
-        manifest_version: 2,
+        manifest_version: 1,
         name: lock.pack.name.clone(),
         version: lock.pack.version.clone(),
         author: author.into(),
@@ -544,6 +544,7 @@ mod tests {
         let json = serde_json::to_value(manifest).expect("manifest JSON");
         assert_eq!(json["files"][0]["projectID"], 123);
         assert_eq!(json["files"][0]["fileID"], 456);
+        assert_eq!(json["manifestVersion"], 1);
         assert!(json["files"][0].get("projectId").is_none());
     }
 
