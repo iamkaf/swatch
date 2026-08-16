@@ -6,14 +6,18 @@ The manifest and lockfile formats are still experimental. They may change before
 
 ## Build and install
 
-Build Swatch with the stable Rust toolchain:
+Download the archive for your platform from
+[GitHub Releases](https://github.com/iamkaf/swatch/releases). Each release also
+includes `SHA256SUMS` for its archives.
+
+To build Swatch from source with the stable Rust toolchain:
 
 ```bash
 cargo build --release
 ./target/release/swatch --help
 ```
 
-For local use, copy `target/release/swatch` into a directory on your `PATH`, or invoke it with its full path from a pack directory. The repository currently documents source builds only.
+For local use, copy `target/release/swatch` into a directory on your `PATH`, or invoke it with its full path from a pack directory.
 
 ## Quick start
 
