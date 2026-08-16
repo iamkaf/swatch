@@ -64,7 +64,7 @@ pub fn index_from_lock(lock: &Lockfile) -> Result<MrpackIndex> {
         lock.pack.loader_version.clone(),
     );
     Ok(MrpackIndex {
-        format_version: 2,
+        format_version: 1,
         game: "minecraft".to_string(),
         version_id: lock.pack.version.clone(),
         name: lock.pack.name.clone(),
@@ -174,6 +174,7 @@ mod tests {
             curseforge: Vec::new(),
         };
         let index = index_from_lock(&lock).expect("index");
+        assert_eq!(index.format_version, 1);
         assert_eq!(index.files[0].path, "mods/a.jar");
         assert_eq!(index.files[1].env.server, SideRequirement::Unsupported);
         assert_eq!(
