@@ -67,7 +67,10 @@ fn migrate_legacy_object(file: &FileSpec, dest: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let bytes = legacy_object_bytes(file, dest)?;
+    let Some(bytes) = legacy_object_bytes(file, dest)? else {
+        fs::remove_dir_all(dest)?;
+        return Ok(false);
+    };
     let parent = dest
         .parent()
         .ok_or_else(|| crate::Error::from("cache object has no parent directory"))?;
@@ -93,7 +96,7 @@ fn migrate_legacy_object(file: &FileSpec, dest: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn legacy_object_bytes(file: &FileSpec, directory: &Path) -> Result<Vec<u8>> {
+fn legacy_object_bytes(file: &FileSpec, directory: &Path) -> Result<Option<Vec<u8>>> {
     let mut entries: Vec<_> = fs::read_dir(directory)?.collect();
     entries.sort_by_key(|entry| {
         entry
@@ -101,25 +104,17 @@ fn legacy_object_bytes(file: &FileSpec, directory: &Path) -> Result<Vec<u8>> {
             .map(|entry| entry.file_name())
             .unwrap_or_default()
     });
-    let mut last_error = None;
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
         let bytes = fs::read(entry.path())?;
-        match verify_bytes(file, &bytes) {
-            Ok(()) => return Ok(bytes),
-            Err(error) => last_error = Some(error),
+        if verify_bytes(file, &bytes).is_ok() {
+            return Ok(Some(bytes));
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        format!(
-            "{} legacy cache directory has no file matching its pins",
-            file.path
-        )
-        .into()
-    }))
+    Ok(None)
 }
 
 fn cache_bytes(root: &PackRoot, file: &FileSpec, bytes: &[u8]) -> Result<PathBuf> {
@@ -254,5 +249,22 @@ mod tests {
         assert!(object.is_file());
         assert!(!legacy.exists());
         assert_eq!(fs::read(object).expect("migrated bytes"), b"");
+    }
+
+    #[test]
+    fn invalid_legacy_cache_does_not_block_a_fresh_object() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        let file = file("mods/example.jar");
+        let object = cached_file(&root, &file);
+        fs::create_dir_all(&object).expect("legacy object directory");
+        fs::write(object.join("interrupted.jar"), b"corrupt").expect("interrupted object");
+
+        assert!(!migrate_legacy_object(&file, &object).expect("discard invalid legacy cache"));
+        assert!(!object.exists());
+        cache_bytes(&root, &file, &[]).expect("fresh cached object");
+        assert!(object.is_file());
     }
 }
