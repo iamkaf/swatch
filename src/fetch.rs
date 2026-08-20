@@ -41,15 +41,17 @@ pub fn ensure_all(root: &PackRoot, files: &[FileSpec]) -> Result<VerifiedFiles> 
             continue;
         }
         let dest = cached_file(root, file);
-        if dest.is_file() {
-            verify_bytes(file, &fs::read(&dest)?)?;
-        } else {
-            let client = match &client {
-                Some(client) => client,
-                None => client.insert(http_client()?),
-            };
-            let bytes = download(client, file)?;
-            cache_bytes(root, file, &bytes)?;
+        if !migrate_legacy_object(file, &dest)? {
+            if dest.is_file() {
+                verify_bytes(file, &fs::read(&dest)?)?;
+            } else {
+                let client = match &client {
+                    Some(client) => client,
+                    None => client.insert(http_client()?),
+                };
+                let bytes = download(client, file)?;
+                cache_bytes(root, file, &bytes)?;
+            }
         }
         objects.insert(
             file.sha512.clone(),
@@ -58,6 +60,66 @@ pub fn ensure_all(root: &PackRoot, files: &[FileSpec]) -> Result<VerifiedFiles> 
         paths.insert(file.path.clone(), dest);
     }
     Ok(VerifiedFiles { paths })
+}
+
+fn migrate_legacy_object(file: &FileSpec, dest: &Path) -> Result<bool> {
+    if !dest.is_dir() {
+        return Ok(false);
+    }
+
+    let bytes = legacy_object_bytes(file, dest)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| crate::Error::from("cache object has no parent directory"))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(&bytes)?;
+
+    let backup = tempfile::Builder::new()
+        .prefix(".swatch-legacy-")
+        .tempdir_in(parent)?;
+    let legacy = backup.path().join("object");
+    fs::rename(dest, &legacy)?;
+    if let Err(error) = staged.persist(dest) {
+        let persist_error = error.error;
+        if let Err(restore_error) = fs::rename(&legacy, dest) {
+            return Err(format!(
+                "could not migrate {}: {persist_error}; could not restore its legacy cache directory: {restore_error}",
+                file.path
+            )
+            .into());
+        }
+        return Err(persist_error.into());
+    }
+    Ok(true)
+}
+
+fn legacy_object_bytes(file: &FileSpec, directory: &Path) -> Result<Vec<u8>> {
+    let mut entries: Vec<_> = fs::read_dir(directory)?.collect();
+    entries.sort_by_key(|entry| {
+        entry
+            .as_ref()
+            .map(|entry| entry.file_name())
+            .unwrap_or_default()
+    });
+    let mut last_error = None;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        match verify_bytes(file, &bytes) {
+            Ok(()) => return Ok(bytes),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        format!(
+            "{} legacy cache directory has no file matching its pins",
+            file.path
+        )
+        .into()
+    }))
 }
 
 fn cache_bytes(root: &PackRoot, file: &FileSpec, bytes: &[u8]) -> Result<PathBuf> {
@@ -172,5 +234,25 @@ mod tests {
         fs::create_dir_all(object.parent().expect("object directory")).expect("object directory");
         fs::write(object, b"corrupt").expect("cached object");
         assert!(ensure_all(&root, &[file]).is_err());
+    }
+
+    #[test]
+    fn migrates_a_verified_legacy_object_without_downloading() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        let file = file("mods/example.jar");
+        let object = cached_file(&root, &file);
+        let legacy = object.join("example.jar");
+        fs::create_dir_all(&object).expect("legacy object directory");
+        fs::write(&legacy, []).expect("legacy cached object");
+
+        let verified = ensure_all(&root, std::slice::from_ref(&file)).expect("migration");
+
+        assert_eq!(verified.path(&file).expect("verified object"), object);
+        assert!(object.is_file());
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(object).expect("migrated bytes"), b"");
     }
 }
