@@ -59,7 +59,7 @@ pub fn dry_run(release: &PreparedRelease) -> Result<Vec<String>> {
     )])
 }
 
-pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<String>> {
+pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
     let config = release
         .config
         .modrinth
@@ -73,13 +73,13 @@ pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<
         return Ok(vec![message]);
     }
 
-    let loaders = vec![release.lock.pack.loader.clone()];
+    let loaders = vec![release.lock.pack.loader.as_str().to_string()];
     let game_versions = vec![release.lock.pack.minecraft.clone()];
-    let changelog = release.changelog(root)?;
+    let changelog = release.changelog()?;
     let data = serde_json::to_string(&VersionData {
         name: &format!("{} {}", release.lock.pack.name, release.lock.pack.version),
         version_number: &release.lock.pack.version,
-        changelog: &changelog,
+        changelog,
         version_type: "release",
         loaders: &loaders,
         game_versions: &game_versions,

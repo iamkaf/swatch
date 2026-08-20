@@ -56,7 +56,7 @@ pub fn dry_run(release: &PreparedRelease) -> Result<Vec<String>> {
     Ok(output)
 }
 
-pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<String>> {
+pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
     let config = release
         .config
         .github
@@ -67,7 +67,7 @@ pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<
         .or_else(|_| std::env::var("GH_TOKEN"))
         .map_err(|_| crate::Error::from("set GITHUB_TOKEN (or GH_TOKEN)"))?;
     let client = http_client()?;
-    let github_release = find_or_create_release(&client, &token, release, root)?;
+    let github_release = find_or_create_release(&client, &token, release)?;
     let mut output = Vec::new();
     for artifact in release.artifacts.iter().filter(|artifact| {
         matches!(
@@ -86,7 +86,6 @@ fn find_or_create_release(
     client: &reqwest::blocking::Client,
     token: &str,
     prepared: &PreparedRelease,
-    root: &crate::PackRoot,
 ) -> Result<Release> {
     let config = prepared.config.github.as_ref().expect("checked by caller");
     let url = format!(
@@ -97,14 +96,14 @@ fn find_or_create_release(
     if response.status() != reqwest::StatusCode::NOT_FOUND {
         return Ok(response.error_for_status()?.json()?);
     }
-    let body = prepared.changelog(root)?;
+    let body = prepared.changelog()?;
     let response = client
         .post(format!("{API_BASE}/repos/{}/releases", config.repository))
         .bearer_auth(token)
         .json(&NewRelease {
             tag_name: &prepared.lock.pack.version,
             name: &format!("{} {}", prepared.lock.pack.name, prepared.lock.pack.version),
-            body: &body,
+            body,
             draft: false,
             prerelease: false,
         })

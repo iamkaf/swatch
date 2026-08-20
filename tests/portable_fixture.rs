@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
+use swatch::spec::{ContentPlacement, Loader};
 use swatch::{PackRoot, load_lock, load_spec};
 use zip::ZipArchive;
 
@@ -18,9 +19,9 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
     assert_eq!(spec.pack.name, "Copper Valley");
     assert_eq!(spec.pack.slug, "copper-valley");
     assert_eq!(spec.pack.group, "org.example.packs");
-    assert_eq!(spec.pack.loader, "neoforge");
+    assert_eq!(spec.pack.loader, Loader::NeoForge);
     assert!(spec.content().any(|content| {
-        content.id == "dedicated-fixture" && content.side == swatch::spec::ContentSide::Server
+        content.id == "dedicated-fixture" && content.placement == ContentPlacement::ServerMod
     }));
     assert!(lock.file.iter().any(|file| {
         file.id == "dedicated-fixture"

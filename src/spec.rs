@@ -24,8 +24,32 @@ pub struct PackMeta {
     pub version: String,
     pub group: String,
     pub minecraft: String,
-    pub loader: String,
+    pub loader: Loader,
     pub loader_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Loader {
+    Fabric,
+    Forge,
+    NeoForge,
+}
+
+impl Loader {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fabric => "fabric",
+            Self::Forge => "forge",
+            Self::NeoForge => "neoforge",
+        }
+    }
+}
+
+impl std::fmt::Display for Loader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,50 +75,58 @@ impl FileSpec {
         if self.downloads.len() != 1 || !self.downloads[0].starts_with("https://") {
             return Err(format!("{} must have one HTTPS download", self.path).into());
         }
-        if self.sha1.len() != 40 || self.sha512.len() != 128 {
-            return Err(format!("{} is missing a full sha1/sha512 pin", self.path).into());
-        }
+        check_digest(&self.sha1, 40, "sha1", &self.path)?;
+        check_digest(&self.sha512, 128, "sha512", &self.path)?;
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentSide {
-    Both,
-    Client,
-    Server,
-}
-
-impl ContentSide {
-    pub fn env(self) -> EnvSpec {
-        match self {
-            Self::Both => EnvSpec {
-                client: SideRequirement::Required,
-                server: SideRequirement::Required,
-            },
-            Self::Client => EnvSpec {
-                client: SideRequirement::Required,
-                server: SideRequirement::Unsupported,
-            },
-            Self::Server => EnvSpec {
-                client: SideRequirement::Unsupported,
-                server: SideRequirement::Required,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentKind {
-    Mod,
+pub enum ContentPlacement {
+    SharedMod,
+    ClientMod,
+    ServerMod,
     Shader,
 }
 
-impl ContentKind {
+impl ContentPlacement {
+    pub fn manifest_table(self) -> &'static str {
+        match self {
+            Self::SharedMod => "mods",
+            Self::ClientMod => "client_mods",
+            Self::ServerMod => "server_mods",
+            Self::Shader => "shaders",
+        }
+    }
+
     pub fn folder(self) -> &'static str {
         match self {
-            Self::Mod => "mods",
+            Self::SharedMod | Self::ClientMod | Self::ServerMod => "mods",
             Self::Shader => "shaderpacks",
+        }
+    }
+
+    pub fn modrinth_kind(self) -> &'static str {
+        match self {
+            Self::SharedMod | Self::ClientMod | Self::ServerMod => "mod",
+            Self::Shader => "shader",
+        }
+    }
+
+    pub fn env(self) -> EnvSpec {
+        match self {
+            Self::SharedMod => EnvSpec {
+                client: SideRequirement::Required,
+                server: SideRequirement::Required,
+            },
+            Self::ClientMod | Self::Shader => EnvSpec {
+                client: SideRequirement::Required,
+                server: SideRequirement::Unsupported,
+            },
+            Self::ServerMod => EnvSpec {
+                client: SideRequirement::Unsupported,
+                server: SideRequirement::Required,
+            },
         }
     }
 }
@@ -103,8 +135,7 @@ impl ContentKind {
 pub struct ContentSpec {
     pub id: String,
     pub version: String,
-    pub kind: ContentKind,
-    pub side: ContentSide,
+    pub placement: ContentPlacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,30 +172,18 @@ impl PackSpec {
                 + document.server_mods.len()
                 + document.shaders.len(),
         );
-        append_content(
-            &mut content,
-            document.mods,
-            ContentKind::Mod,
-            ContentSide::Both,
-        );
+        append_content(&mut content, document.mods, ContentPlacement::SharedMod);
         append_content(
             &mut content,
             document.client_mods,
-            ContentKind::Mod,
-            ContentSide::Client,
+            ContentPlacement::ClientMod,
         );
         append_content(
             &mut content,
             document.server_mods,
-            ContentKind::Mod,
-            ContentSide::Server,
+            ContentPlacement::ServerMod,
         );
-        append_content(
-            &mut content,
-            document.shaders,
-            ContentKind::Shader,
-            ContentSide::Client,
-        );
+        append_content(&mut content, document.shaders, ContentPlacement::Shader);
         let spec = Self {
             format: document.format,
             pack: document.pack,
@@ -207,14 +226,12 @@ impl PackSpec {
 fn append_content(
     content: &mut Vec<ContentSpec>,
     entries: BTreeMap<String, String>,
-    kind: ContentKind,
-    side: ContentSide,
+    placement: ContentPlacement,
 ) {
     content.extend(entries.into_iter().map(|(id, version)| ContentSpec {
         id,
         version,
-        kind,
-        side,
+        placement,
     }));
 }
 
@@ -231,10 +248,17 @@ fn validate_pack_meta(pack: &PackMeta) -> Result<()> {
     if pack.loader_version.trim().is_empty() {
         return Err("pack.loader_version is required".into());
     }
-    if !matches!(pack.loader.as_str(), "fabric" | "forge" | "neoforge") {
+    Ok(())
+}
+
+fn check_digest(value: &str, width: usize, name: &str, path: &str) -> Result<()> {
+    if value.len() != width
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
         return Err(format!(
-            "pack.loader `{}` is not supported; use fabric, forge, or neoforge",
-            pack.loader
+            "{path} must have a {width}-character lowercase hexadecimal {name} pin"
         )
         .into());
     }
@@ -312,16 +336,21 @@ impl Lockfile {
     pub fn parse(text: &str) -> Result<Self> {
         let lock: Self = toml::from_str(text)
             .map_err(|error| Error::from(format!("pack.lock.toml: {error}")))?;
-        if lock.version != 2 {
-            return Err(format!("unsupported lock version {}", lock.version).into());
+        lock.validate()?;
+        Ok(lock)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 2 {
+            return Err(format!("unsupported lock version {}", self.version).into());
         }
-        validate_pack_meta(&lock.pack)?;
-        if lock.file.is_empty() {
+        validate_pack_meta(&self.pack)?;
+        if self.file.is_empty() {
             return Err("pack.lock.toml has no [[file]] entries".into());
         }
         let mut ids = BTreeSet::new();
         let mut paths = BTreeSet::new();
-        for file in &lock.file {
+        for file in &self.file {
             file.validate()?;
             if !ids.insert(file.id.as_str()) {
                 return Err(format!("duplicate locked content ID {}", file.id).into());
@@ -330,14 +359,15 @@ impl Lockfile {
                 return Err(format!("duplicate pack path {}", file.path).into());
             }
         }
-        let pins: BTreeSet<_> = lock
+        let pins: BTreeSet<_> = self
             .file
             .iter()
             .map(|file| (file.path.as_str(), file.sha1.as_str()))
             .collect();
         let mut mapped = BTreeSet::new();
-        for file in &lock.curseforge {
+        for file in &self.curseforge {
             check_pack_path(&file.path)?;
+            check_digest(&file.sha1, 40, "sha1", &file.path)?;
             if file.project_id == 0 || file.file_id == 0 {
                 return Err(format!("{} has an invalid CurseForge ID", file.path).into());
             }
@@ -348,10 +378,11 @@ impl Lockfile {
                 return Err(format!("duplicate CurseForge mapping for {}", file.path).into());
             }
         }
-        Ok(lock)
+        Ok(())
     }
 
     pub fn to_toml(&self) -> Result<String> {
+        self.validate()?;
         Ok(toml::to_string_pretty(self)?)
     }
 }
@@ -384,6 +415,34 @@ pub fn client_file(file: &FileSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_file() -> FileSpec {
+        FileSpec {
+            id: "example".into(),
+            requested_version: "1.0.0".into(),
+            path: "mods/example.jar".into(),
+            file_size: 0,
+            sha1: "a".repeat(40),
+            sha512: "b".repeat(128),
+            env: ContentPlacement::SharedMod.env(),
+            downloads: vec!["https://example.invalid/example.jar".into()],
+        }
+    }
+
+    fn valid_lock(loader: Loader) -> Lockfile {
+        Lockfile::new(
+            PackMeta {
+                name: "Example Pack".into(),
+                slug: "example-pack".into(),
+                version: "1.0.0".into(),
+                group: "org.example.packs".into(),
+                minecraft: "26.2".into(),
+                loader,
+                loader_version: "1.0.0".into(),
+            },
+            vec![valid_file()],
+        )
+    }
 
     #[test]
     fn rejects_unsafe_pack_paths_and_coordinates() {
@@ -456,9 +515,9 @@ dedicated = "1.2.3"
             );
             let spec = PackSpec::parse(&text).expect("supported loader");
             let content = spec.content().next().expect("server mod");
-            assert_eq!(content.side, ContentSide::Server);
-            assert_eq!(content.side.env().client, SideRequirement::Unsupported);
-            assert_eq!(content.side.env().server, SideRequirement::Required);
+            assert_eq!(content.placement, ContentPlacement::ServerMod);
+            assert_eq!(content.placement.env().client, SideRequirement::Unsupported);
+            assert_eq!(content.placement.env().server, SideRequirement::Required);
         }
     }
 
@@ -480,6 +539,126 @@ loader_version = "1.0.0"
 example = "1.2.3"
 "#;
         let error = PackSpec::parse(text).expect_err("unknown loader");
-        assert!(error.to_string().contains("fabric, forge, or neoforge"));
+        let message = error.to_string();
+        assert!(message.contains("fabric"));
+        assert!(message.contains("forge"));
+        assert!(message.contains("neoforge"));
+    }
+
+    #[test]
+    fn placements_own_manifest_folder_and_environment() {
+        let cases = [
+            (ContentPlacement::SharedMod, "mods", "mods", true, true),
+            (
+                ContentPlacement::ClientMod,
+                "client_mods",
+                "mods",
+                true,
+                false,
+            ),
+            (
+                ContentPlacement::ServerMod,
+                "server_mods",
+                "mods",
+                false,
+                true,
+            ),
+            (
+                ContentPlacement::Shader,
+                "shaders",
+                "shaderpacks",
+                true,
+                false,
+            ),
+        ];
+        for (placement, table, folder, client, server) in cases {
+            assert_eq!(placement.manifest_table(), table);
+            assert_eq!(placement.folder(), folder);
+            assert_eq!(placement.env().client == SideRequirement::Required, client);
+            assert_eq!(placement.env().server == SideRequirement::Required, server);
+        }
+    }
+
+    #[test]
+    fn parses_each_manifest_table_as_one_legal_placement() {
+        let spec = PackSpec::parse(
+            r#"format = 1
+
+[pack]
+name = "Example Pack"
+slug = "example-pack"
+version = "1.0.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "fabric"
+loader_version = "0.19.3"
+
+[mods]
+shared = "1"
+
+[client_mods]
+client = "1"
+
+[server_mods]
+server = "1"
+
+[shaders]
+shader = "1"
+"#,
+        )
+        .expect("all placements");
+        let placements: BTreeMap<_, _> = spec
+            .content()
+            .map(|content| (content.id.as_str(), content.placement))
+            .collect();
+        assert_eq!(placements["shared"], ContentPlacement::SharedMod);
+        assert_eq!(placements["client"], ContentPlacement::ClientMod);
+        assert_eq!(placements["server"], ContentPlacement::ServerMod);
+        assert_eq!(placements["shader"], ContentPlacement::Shader);
+    }
+
+    #[test]
+    fn rejects_noncanonical_digests_before_they_become_paths() {
+        let mut file = valid_file();
+        for digest in [
+            "b".repeat(127),
+            "B".repeat(128),
+            format!("{}g", "b".repeat(127)),
+            format!("{}/{}", "b".repeat(63), "b".repeat(64)),
+            format!("{}..", "b".repeat(126)),
+            format!("/{}", "b".repeat(127)),
+        ] {
+            file.sha512 = digest;
+            assert!(file.validate().is_err(), "accepted {}", file.sha512);
+        }
+    }
+
+    #[test]
+    fn lock_serialization_reuses_parse_validation() {
+        let mut lock = valid_lock(Loader::Fabric);
+        lock.file.push(lock.file[0].clone());
+        let encode_error = lock
+            .to_toml()
+            .expect_err("duplicate lock entry")
+            .to_string();
+        assert!(encode_error.contains("duplicate locked content ID"));
+
+        lock.file.pop();
+        lock.file[0].path = "../outside.jar".into();
+        let encode_error = lock.to_toml().expect_err("unsafe path").to_string();
+        assert!(encode_error.contains("invalid relative pack path"));
+    }
+
+    #[test]
+    fn every_loader_round_trips_through_lock_toml() {
+        for loader in [Loader::Fabric, Loader::Forge, Loader::NeoForge] {
+            let lock = valid_lock(loader);
+            let text = lock.to_toml().expect("encode lock");
+            assert!(text.contains(&format!("loader = \"{}\"", loader.as_str())));
+            assert_eq!(
+                Lockfile::parse(&text).expect("parse lock").pack.loader,
+                loader
+            );
+        }
     }
 }

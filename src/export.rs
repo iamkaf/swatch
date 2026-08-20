@@ -1,4 +1,4 @@
-use crate::spec::{FileSpec, Lockfile, SideRequirement, check_pack_path};
+use crate::spec::{FileSpec, Loader, Lockfile, SideRequirement, check_pack_path};
 use crate::{PackRoot, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -38,10 +38,9 @@ pub struct MrpackEnv {
     pub server: SideRequirement,
 }
 
-pub fn export(root: &PackRoot) -> Result<std::path::PathBuf> {
-    let lock = crate::load_lock(root)?;
+pub(crate) fn export_from_lock(root: &PackRoot, lock: &Lockfile) -> Result<std::path::PathBuf> {
     fs::create_dir_all(root.dist_dir())?;
-    let index = index_from_lock(&lock)?;
+    let index = index_from_lock(lock)?;
     let index_bytes = serde_json::to_vec_pretty(&index)?;
     let mut index_bytes = index_bytes;
     if !index_bytes.ends_with(b"\n") {
@@ -62,7 +61,7 @@ pub fn index_from_lock(lock: &Lockfile) -> Result<MrpackIndex> {
     let mut dependencies = BTreeMap::new();
     dependencies.insert("minecraft".to_string(), lock.pack.minecraft.clone());
     dependencies.insert(
-        loader_dependency_key(&lock.pack.loader)?.to_string(),
+        loader_dependency_key(lock.pack.loader).to_string(),
         lock.pack.loader_version.clone(),
     );
     Ok(MrpackIndex {
@@ -92,12 +91,11 @@ fn mrpack_file(file: &FileSpec) -> Result<MrpackFile> {
     })
 }
 
-fn loader_dependency_key(loader: &str) -> Result<&'static str> {
+fn loader_dependency_key(loader: Loader) -> &'static str {
     match loader {
-        "fabric" => Ok("fabric-loader"),
-        "forge" => Ok("forge"),
-        "neoforge" => Ok("neoforge"),
-        other => Err(format!("unsupported loader `{other}`").into()),
+        Loader::Fabric => "fabric-loader",
+        Loader::Forge => "forge",
+        Loader::NeoForge => "neoforge",
     }
 }
 
@@ -130,7 +128,7 @@ fn write_mrpack(dest: &Path, index_bytes: &[u8], root: &PackRoot) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{EnvSpec, FileSpec, PackMeta, SideRequirement};
+    use crate::spec::{EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
     use std::io::Read;
 
     #[test]
@@ -143,7 +141,7 @@ mod tests {
                 version: "1.1.1".into(),
                 group: "org.example.packs".into(),
                 minecraft: "26.2".into(),
-                loader: "fabric".into(),
+                loader: Loader::Fabric,
                 loader_version: "0.19.3".into(),
             },
             file: vec![
@@ -193,7 +191,7 @@ mod tests {
             path: temp.path().into(),
         };
         fs::write(root.lock_toml(), lock.to_toml().expect("lock TOML")).expect("lockfile");
-        let archive = export(&root).expect("mrpack");
+        let archive = export_from_lock(&root, &lock).expect("mrpack");
         let file = File::open(archive).expect("mrpack file");
         let mut zip = zip::ZipArchive::new(file).expect("mrpack zip");
         let mut index_json = String::new();
@@ -204,5 +202,12 @@ mod tests {
         let index_json: serde_json::Value =
             serde_json::from_str(&index_json).expect("parsed index JSON");
         assert_eq!(index_json["formatVersion"], 1);
+    }
+
+    #[test]
+    fn maps_every_loader_to_its_modrinth_dependency() {
+        assert_eq!(loader_dependency_key(Loader::Fabric), "fabric-loader");
+        assert_eq!(loader_dependency_key(Loader::Forge), "forge");
+        assert_eq!(loader_dependency_key(Loader::NeoForge), "neoforge");
     }
 }
