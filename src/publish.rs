@@ -108,6 +108,7 @@ struct PreparedRelease {
     lock: Lockfile,
     config: PublishConfig,
     artifacts: Vec<Artifact>,
+    changelog: Option<String>,
 }
 
 impl PreparedRelease {
@@ -118,33 +119,44 @@ impl PreparedRelease {
             .ok_or_else(|| format!("prepared release is missing a {kind:?} artifact").into())
     }
 
-    fn changelog(&self, root: &PackRoot) -> Result<String> {
-        let relative = self.config.changelog.as_deref().unwrap_or("CHANGELOG.md");
-        crate::spec::check_pack_path(relative)?;
-        let path = root.path.join(relative);
-        fs::read_to_string(&path).map_err(|error| {
-            format!("cannot read publish changelog {}: {error}", path.display()).into()
-        })
+    fn changelog(&self) -> Result<&str> {
+        self.changelog
+            .as_deref()
+            .ok_or_else(|| "prepared release has no changelog".into())
     }
 }
 
 /// Resolve every local release artifact once.
 fn prepare(root: &PackRoot, mode: PublishMode) -> Result<PreparedRelease> {
     let lock = crate::load_lock(root)?;
-    let spec = crate::load_spec(root)?;
+    let manifest = fs::read_to_string(root.pack_toml())?;
+    let spec = crate::spec::PackSpec::parse(&manifest)?;
     if !crate::resolve::lock_matches_spec(&spec, &lock) {
         return Err(
             "pack.toml changed since the last install; run `swatch install` before publishing"
                 .into(),
         );
     }
-    let config = load_config(root)?;
+    let config = load_config(&manifest)?;
+    let changelog = if mode == PublishMode::Publish
+        && (config.modrinth.is_some() || config.curseforge.is_some() || config.github.is_some())
+    {
+        Some(load_changelog(root, &config)?)
+    } else {
+        None
+    };
     fs::create_dir_all(root.dist_dir())?;
 
-    let mrpack = crate::export::export(root)?;
+    let mrpack = crate::export::export_from_lock(root, &lock)?;
     let mut artifacts = vec![artifact(&mrpack, ArtifactKind::Modrinth)?];
     if let Some(curseforge_config) = &config.curseforge {
-        let curseforge = crate::curseforge::export(root, &curseforge_config.author)?;
+        let overrides = crate::curseforge::load_config(root)?;
+        let curseforge = crate::curseforge::export_from_lock(
+            root,
+            &curseforge_config.author,
+            &lock,
+            &overrides,
+        )?;
         artifacts.push(artifact(&curseforge, ArtifactKind::CurseForge)?);
     }
     if let Some(maven) = &config.maven {
@@ -177,6 +189,7 @@ fn prepare(root: &PackRoot, mode: PublishMode) -> Result<PreparedRelease> {
         lock,
         config,
         artifacts,
+        changelog,
     })
 }
 
@@ -188,21 +201,21 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
         output.extend(if mode == PublishMode::DryRun {
             modrinth_adapter::dry_run(&release)?
         } else {
-            modrinth_adapter::publish(&release, root)?
+            modrinth_adapter::publish(&release)?
         });
     }
     if release.config.curseforge.is_some() {
         output.extend(if mode == PublishMode::DryRun {
             curseforge_adapter::dry_run(&release)?
         } else {
-            curseforge_adapter::publish(&release, root)?
+            curseforge_adapter::publish(&release)?
         });
     }
     if release.config.github.is_some() {
         output.extend(if mode == PublishMode::DryRun {
             github_adapter::dry_run(&release)?
         } else {
-            github_adapter::publish(&release, root)?
+            github_adapter::publish(&release)?
         });
     }
     if release.config.maven.is_some() {
@@ -218,10 +231,9 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
     Ok(output)
 }
 
-fn load_config(root: &PackRoot) -> Result<PublishConfig> {
-    let text = fs::read_to_string(root.pack_toml())?;
+fn load_config(text: &str) -> Result<PublishConfig> {
     let value: toml::Value =
-        toml::from_str(&text).map_err(|error| crate::Error::from(format!("pack.toml: {error}")))?;
+        toml::from_str(text).map_err(|error| crate::Error::from(format!("pack.toml: {error}")))?;
     let Some(table) = value.get("publish") else {
         return Ok(PublishConfig::default());
     };
@@ -230,6 +242,15 @@ fn load_config(root: &PackRoot) -> Result<PublishConfig> {
         .try_into()
         .map_err(|error| crate::Error::from(format!("pack.toml [publish]: {error}")))?;
     Ok(config)
+}
+
+fn load_changelog(root: &PackRoot, config: &PublishConfig) -> Result<String> {
+    let relative = config.changelog.as_deref().unwrap_or("CHANGELOG.md");
+    crate::spec::check_pack_path(relative)?;
+    let path = root.path.join(relative);
+    fs::read_to_string(&path).map_err(|error| {
+        format!("cannot read publish changelog {}: {error}", path.display()).into()
+    })
 }
 
 fn artifact(path: &Path, kind: ArtifactKind) -> Result<Artifact> {
@@ -410,6 +431,60 @@ fn metadata_xml(group: &str, artifact: &str, version: &str, versions: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::{ContentPlacement, FileSpec, Loader, PackMeta};
+    use std::io::{Cursor, Read};
+
+    fn release_root() -> (tempfile::TempDir, PackRoot, Lockfile) {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        fs::write(
+            root.pack_toml(),
+            r#"format = 1
+
+[pack]
+name = "Example Pack"
+slug = "example-pack"
+version = "1.0.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "fabric"
+loader_version = "0.19.3"
+
+[mods]
+example = "1.0.0"
+
+[publish.github]
+repository = "example/example-pack"
+"#,
+        )
+        .expect("manifest");
+        fs::write(root.path.join("CHANGELOG.md"), "Original notes\n").expect("changelog");
+        let lock = Lockfile::new(
+            PackMeta {
+                name: "Example Pack".into(),
+                slug: "example-pack".into(),
+                version: "1.0.0".into(),
+                group: "org.example.packs".into(),
+                minecraft: "26.2".into(),
+                loader: Loader::Fabric,
+                loader_version: "0.19.3".into(),
+            },
+            vec![FileSpec {
+                id: "example".into(),
+                requested_version: "1.0.0".into(),
+                path: "mods/example.jar".into(),
+                file_size: 0,
+                sha1: "a".repeat(40),
+                sha512: "b".repeat(128),
+                env: ContentPlacement::SharedMod.env(),
+                downloads: vec!["https://example.invalid/example.jar".into()],
+            }],
+        );
+        fs::write(root.lock_toml(), lock.to_toml().expect("lock TOML")).expect("lockfile");
+        (directory, root, lock)
+    }
 
     #[test]
     fn pom_does_not_mention_the_server_launcher() {
@@ -447,5 +522,44 @@ mod tests {
             enabled.curseforge.as_ref().map(|config| config.project),
             Some(123)
         );
+    }
+
+    #[test]
+    fn preparation_retains_one_lock_and_changelog_snapshot() {
+        let (_directory, root, lock) = release_root();
+        let release = prepare(&root, PublishMode::Publish).expect("prepared release");
+
+        let mut replacement = lock;
+        replacement.pack.version = "2.0.0".into();
+        fs::write(
+            root.lock_toml(),
+            replacement.to_toml().expect("replacement lock"),
+        )
+        .expect("replace lock");
+        fs::remove_file(root.path.join("CHANGELOG.md")).expect("remove changelog");
+
+        assert_eq!(release.lock.pack.version, "1.0.0");
+        assert_eq!(
+            release.changelog().expect("captured changelog"),
+            "Original notes\n"
+        );
+        let artifact = release.artifact(ArtifactKind::Modrinth).expect("mrpack");
+        let mut archive = zip::ZipArchive::new(Cursor::new(&artifact.bytes)).expect("mrpack zip");
+        let mut index = String::new();
+        archive
+            .by_name("modrinth.index.json")
+            .expect("index")
+            .read_to_string(&mut index)
+            .expect("index text");
+        let index: serde_json::Value = serde_json::from_str(&index).expect("index JSON");
+        assert_eq!(index["versionId"], "1.0.0");
+    }
+
+    #[test]
+    fn dry_run_does_not_require_release_notes() {
+        let (_directory, root, _lock) = release_root();
+        fs::remove_file(root.path.join("CHANGELOG.md")).expect("remove changelog");
+        let release = prepare(&root, PublishMode::DryRun).expect("dry-run release");
+        assert!(release.changelog.is_none());
     }
 }

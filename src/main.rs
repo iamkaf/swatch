@@ -89,15 +89,25 @@ fn parse_add_args(
     let mut query = None;
     let mut version = None;
     let mut options = authoring::AddOptions::default();
+    let mut placement_flag = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--client" => options.side = Some(swatch::spec::ContentSide::Client),
-            "--server" => options.side = Some(swatch::spec::ContentSide::Server),
-            "--shader" => {
-                options.kind = swatch::spec::ContentKind::Shader;
-                options.side = Some(swatch::spec::ContentSide::Client);
-            }
+            "--client" => set_placement(
+                &mut placement_flag,
+                swatch::spec::ContentPlacement::ClientMod,
+                "--client",
+            )?,
+            "--server" => set_placement(
+                &mut placement_flag,
+                swatch::spec::ContentPlacement::ServerMod,
+                "--server",
+            )?,
+            "--shader" => set_placement(
+                &mut placement_flag,
+                swatch::spec::ContentPlacement::Shader,
+                "--shader",
+            )?,
             "--version" => {
                 index += 1;
                 version = Some(args.get(index).ok_or("--version requires a value")?.clone());
@@ -127,7 +137,20 @@ fn parse_add_args(
             "usage: {TOOL_NAME} add <project> [--version <version>] [--client|--server|--shader]"
         ))
     })?;
+    options.placement = placement_flag.map(|(placement, _)| placement);
     Ok((query, version, options))
+}
+
+fn set_placement(
+    selected: &mut Option<(swatch::spec::ContentPlacement, &'static str)>,
+    placement: swatch::spec::ContentPlacement,
+    flag: &'static str,
+) -> swatch::Result<()> {
+    if let Some((_, previous)) = selected {
+        return Err(format!("add placement flags conflict: {previous} and {flag}").into());
+    }
+    *selected = Some((placement, flag));
+    Ok(())
 }
 
 fn print_help() {
@@ -175,5 +198,17 @@ mod tests {
                 .curseforge
         );
         assert!(parse_install_options(&args(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn add_rejects_conflicting_placement_flags() {
+        assert!(parse_add_args(&args(&["sodium", "--client", "--server"])).is_err());
+        assert!(parse_add_args(&args(&["iris", "--shader", "--client"])).is_err());
+        let (_, _, options) =
+            parse_add_args(&args(&["dedicated", "--server"])).expect("server placement");
+        assert_eq!(
+            options.placement,
+            Some(swatch::spec::ContentPlacement::ServerMod)
+        );
     }
 }

@@ -1,22 +1,13 @@
-use crate::spec::{ContentKind, ContentSide};
+use crate::spec::{ContentPlacement, Lockfile};
 use crate::{PackRoot, Result, curseforge, fetch, load_lock, load_spec, resolve};
 use std::fs;
+use std::io::Write;
 use std::str::FromStr;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AddOptions {
-    pub kind: ContentKind,
-    pub side: Option<ContentSide>,
-}
-
-impl Default for AddOptions {
-    fn default() -> Self {
-        Self {
-            kind: ContentKind::Mod,
-            side: None,
-        }
-    }
+    pub placement: Option<ContentPlacement>,
 }
 
 pub fn add(
@@ -40,15 +31,18 @@ pub fn add(
     }
     let version = match requested_version {
         Some(version) if !version.trim().is_empty() => version.to_string(),
-        _ => resolver.latest_version(&spec.pack, options.kind, &project)?,
+        _ => resolver.latest_version(
+            &spec.pack,
+            options.placement.unwrap_or(ContentPlacement::SharedMod),
+            &project,
+        )?,
     };
-    let detected_side = resolver.project_side(&project, options.kind)?;
-    let side = if options.kind == ContentKind::Shader {
-        ContentSide::Client
-    } else {
-        options.side.unwrap_or(detected_side)
-    };
-    append_modrinth(root, options.kind, &project, &version, side)?;
+    let detected = resolver.project_placement(
+        &project,
+        options.placement.unwrap_or(ContentPlacement::SharedMod),
+    )?;
+    let placement = options.placement.unwrap_or(detected);
+    append_modrinth(root, placement, &project, &version)?;
     Ok(project)
 }
 
@@ -70,14 +64,16 @@ pub struct InstallOptions {
 
 pub fn install(root: &PackRoot, options: InstallOptions) -> Result<InstallReport> {
     let spec = load_spec(root)?;
-    let lock = match load_lock(root) {
-        Ok(lock) if resolve::lock_matches_spec(&spec, &lock) => lock,
-        Ok(_) | Err(_) => resolve::resolve_pack(root)?,
+    let previous = load_lock(root).ok();
+    let mut lock = match previous.as_ref() {
+        Some(lock) if resolve::lock_matches_spec(&spec, lock) => lock.clone(),
+        previous => resolve::resolve_candidate(&spec, previous)?,
     };
-    fetch::ensure_all(root, &lock.file)?;
+    let verified = fetch::ensure_all(root, &lock.file)?;
     if options.curseforge {
-        curseforge::ensure_mappings(root)?;
+        lock = curseforge::ensure_mappings(root, lock, &verified)?;
     }
+    write_lock(root, &lock)?;
     Ok(InstallReport {
         files: lock.file.len(),
     })
@@ -90,18 +86,12 @@ pub struct InstallReport {
 
 fn append_modrinth(
     root: &PackRoot,
-    kind: ContentKind,
+    placement: ContentPlacement,
     project: &str,
     version: &str,
-    side: ContentSide,
 ) -> Result<()> {
     let mut text = fs::read_to_string(root.pack_toml())?;
-    let section = match kind {
-        ContentKind::Mod if side == ContentSide::Client => "client_mods",
-        ContentKind::Mod if side == ContentSide::Server => "server_mods",
-        ContentKind::Mod => "mods",
-        ContentKind::Shader => "shaders",
-    };
+    let section = placement.manifest_table();
     let mut document =
         DocumentMut::from_str(&text).map_err(|error| format!("pack.toml: {error}"))?;
     let section_item = document.entry(section).or_insert(Item::Table(Table::new()));
@@ -112,6 +102,21 @@ fn append_modrinth(
     text = document.to_string();
     crate::spec::PackSpec::parse(&text)?;
     fs::write(root.pack_toml(), text)?;
+    Ok(())
+}
+
+fn write_lock(root: &PackRoot, lock: &Lockfile) -> Result<()> {
+    let text = lock.to_toml()?;
+    let parent = root
+        .lock_toml()
+        .parent()
+        .ok_or_else(|| crate::Error::from("pack.lock.toml has no parent directory"))?
+        .to_path_buf();
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(text.as_bytes())?;
+    temporary
+        .persist(root.lock_toml())
+        .map_err(|error| crate::Error::from_display(error.error))?;
     Ok(())
 }
 
@@ -144,6 +149,34 @@ fn remove_entry(text: &str, query: &str) -> Result<(String, bool)> {
 #[cfg(test)]
 mod authoring_tests {
     use super::*;
+    use crate::spec::{EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
+
+    fn lock() -> Lockfile {
+        Lockfile::new(
+            PackMeta {
+                name: "Example Pack".into(),
+                slug: "example-pack".into(),
+                version: "1.0.0".into(),
+                group: "org.example.packs".into(),
+                minecraft: "26.2".into(),
+                loader: Loader::Fabric,
+                loader_version: "0.19.3".into(),
+            },
+            vec![FileSpec {
+                id: "example".into(),
+                requested_version: "1.0.0".into(),
+                path: "mods/example.jar".into(),
+                file_size: 0,
+                sha1: "a".repeat(40),
+                sha512: "b".repeat(128),
+                env: EnvSpec {
+                    client: SideRequirement::Required,
+                    server: SideRequirement::Required,
+                },
+                downloads: vec!["https://example.invalid/example.jar".into()],
+            }],
+        )
+    }
 
     #[test]
     fn keeps_unknown_content_when_removing_missing_project() {
@@ -178,10 +211,9 @@ mod authoring_tests {
     #[test]
     fn add_options_can_target_server_content() {
         let options = AddOptions {
-            kind: ContentKind::Mod,
-            side: Some(ContentSide::Server),
+            placement: Some(ContentPlacement::ServerMod),
         };
-        assert_eq!(options.side, Some(ContentSide::Server));
+        assert_eq!(options.placement, Some(ContentPlacement::ServerMod));
     }
 
     #[test]
@@ -210,14 +242,8 @@ curseforge = false
 "#;
         fs::write(root.pack_toml(), original).expect("write manifest");
 
-        append_modrinth(
-            &root,
-            ContentKind::Mod,
-            "dedicated",
-            "2.0.0",
-            ContentSide::Server,
-        )
-        .expect("add server mod");
+        append_modrinth(&root, ContentPlacement::ServerMod, "dedicated", "2.0.0")
+            .expect("add server mod");
 
         let updated = fs::read_to_string(root.pack_toml()).expect("read manifest");
         assert!(updated.starts_with(original));
@@ -228,8 +254,30 @@ curseforge = false
             spec.content()
                 .find(|content| content.id == "dedicated")
                 .expect("server mod")
-                .side,
-            ContentSide::Server
+                .placement,
+            ContentPlacement::ServerMod
+        );
+    }
+
+    #[test]
+    fn lock_commit_replaces_only_with_a_valid_candidate() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        fs::write(root.lock_toml(), "old lock\n").expect("old lock");
+
+        let valid = lock();
+        write_lock(&root, &valid).expect("commit valid lock");
+        let committed = fs::read_to_string(root.lock_toml()).expect("committed lock");
+        assert_eq!(Lockfile::parse(&committed).expect("valid lock"), valid);
+
+        let mut invalid = valid;
+        invalid.file[0].path = "../outside.jar".into();
+        assert!(write_lock(&root, &invalid).is_err());
+        assert_eq!(
+            fs::read_to_string(root.lock_toml()).expect("retained lock"),
+            committed
         );
     }
 }

@@ -1,8 +1,7 @@
-use crate::spec::{ContentKind, ContentSpec, FileSpec, PackMeta};
-use crate::{PackRoot, Result, USER_AGENT, fetch, load_lock, load_spec};
+use crate::spec::{ContentPlacement, ContentSpec, FileSpec, Lockfile, PackMeta};
+use crate::{Result, USER_AGENT};
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use std::fs;
 use std::time::Duration;
 
 const MODRINTH_API: &str = "https://api.modrinth.com/v2";
@@ -87,21 +86,18 @@ impl Resolver {
         }
     }
 
-    pub fn project_side(
+    pub fn project_placement(
         &self,
         project: &str,
-        kind: ContentKind,
-    ) -> Result<crate::spec::ContentSide> {
+        requested: ContentPlacement,
+    ) -> Result<ContentPlacement> {
         let project: ModrinthProject = self
             .client
             .get(format!("{MODRINTH_API}/project/{project}"))
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)?
             .json()?;
-        let expected_type = match kind {
-            ContentKind::Mod => "mod",
-            ContentKind::Shader => "shader",
-        };
+        let expected_type = requested.modrinth_kind();
         if project.project_type != expected_type {
             return Err(format!(
                 "Modrinth project {} is a {}, not a {expected_type}",
@@ -109,30 +105,35 @@ impl Resolver {
             )
             .into());
         }
+        if requested == ContentPlacement::Shader {
+            return Ok(ContentPlacement::Shader);
+        }
         match (project.client_side.as_str(), project.server_side.as_str()) {
-            (_, "unsupported") => Ok(crate::spec::ContentSide::Client),
-            ("unsupported", _) => Ok(crate::spec::ContentSide::Server),
-            _ => Ok(crate::spec::ContentSide::Both),
+            (_, "unsupported") => Ok(ContentPlacement::ClientMod),
+            ("unsupported", _) => Ok(ContentPlacement::ServerMod),
+            _ => Ok(ContentPlacement::SharedMod),
         }
     }
 
     pub fn latest_version(
         &self,
         pack: &PackMeta,
-        kind: ContentKind,
+        placement: ContentPlacement,
         project: &str,
     ) -> Result<String> {
         let url = format!("{MODRINTH_API}/project/{project}/version");
         let request = self.client.get(url);
-        let request = match kind {
-            ContentKind::Mod => request.query(&[
+        let request = match placement {
+            ContentPlacement::SharedMod
+            | ContentPlacement::ClientMod
+            | ContentPlacement::ServerMod => request.query(&[
                 ("loaders", serde_json::to_string(&[pack.loader.as_str()])?),
                 (
                     "game_versions",
                     serde_json::to_string(&[pack.minecraft.as_str()])?,
                 ),
             ]),
-            ContentKind::Shader => request.query(&[(
+            ContentPlacement::Shader => request.query(&[(
                 "game_versions",
                 serde_json::to_string(&[pack.minecraft.as_str()])?,
             )]),
@@ -158,15 +159,17 @@ impl Resolver {
         let requested_version = &content.version;
         let url = format!("{MODRINTH_API}/project/{project}/version");
         let request = self.client.get(&url);
-        let request = match content.kind {
-            ContentKind::Mod => request.query(&[
+        let request = match content.placement {
+            ContentPlacement::SharedMod
+            | ContentPlacement::ClientMod
+            | ContentPlacement::ServerMod => request.query(&[
                 ("loaders", serde_json::to_string(&[pack.loader.as_str()])?),
                 (
                     "game_versions",
                     serde_json::to_string(&[pack.minecraft.as_str()])?,
                 ),
             ]),
-            ContentKind::Shader => request.query(&[(
+            ContentPlacement::Shader => request.query(&[(
                 "game_versions",
                 serde_json::to_string(&[pack.minecraft.as_str()])?,
             )]),
@@ -185,11 +188,11 @@ impl Resolver {
         Ok(FileSpec {
             id: project.to_string(),
             requested_version: requested_version.to_string(),
-            path: format!("{}/{}", content.kind.folder(), file.filename),
+            path: format!("{}/{}", content.placement.folder(), file.filename),
             file_size: file.size,
             sha1: file.hashes.sha1.clone(),
             sha512: file.hashes.sha512.clone(),
-            env: content.side.env(),
+            env: content.placement.env(),
             downloads: vec![file.url.clone()],
         })
     }
@@ -223,8 +226,10 @@ struct ModrinthSearchHit {
     title: String,
 }
 
-pub fn resolve_pack(root: &PackRoot) -> Result<crate::spec::Lockfile> {
-    let spec = load_spec(root)?;
+pub fn resolve_candidate(
+    spec: &crate::spec::PackSpec,
+    previous: Option<&Lockfile>,
+) -> Result<Lockfile> {
     let resolver = Resolver::new()?;
     let total = spec.content_count();
     let mut files = Vec::with_capacity(total);
@@ -234,13 +239,10 @@ pub fn resolve_pack(root: &PackRoot) -> Result<crate::spec::Lockfile> {
         file.validate()?;
         files.push(file);
     }
-    fetch::ensure_all(root, &files)?;
-    let previous = load_lock(root).ok();
-    let mut lock = crate::spec::Lockfile::new(spec.pack, files);
+    let mut lock = Lockfile::new(spec.pack.clone(), files);
     if let Some(previous) = previous {
-        lock.retain_curseforge_from(&previous);
+        lock.retain_curseforge_from(previous);
     }
-    fs::write(root.lock_toml(), lock.to_toml()?)?;
     Ok(lock)
 }
 
@@ -253,10 +255,10 @@ pub fn lock_matches_spec(spec: &crate::spec::PackSpec, lock: &crate::spec::Lockf
             return false;
         };
         file.requested_version == content.version
-            && file.env == content.side.env()
+            && file.env == content.placement.env()
             && file
                 .path
-                .starts_with(&format!("{}/", content.kind.folder()))
+                .starts_with(&format!("{}/", content.placement.folder()))
     })
 }
 

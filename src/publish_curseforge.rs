@@ -1,4 +1,5 @@
 use super::{ArtifactKind, PreparedRelease, Result, http_client};
+use crate::spec::Loader;
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://minecraft.curseforge.com/api/projects";
@@ -40,7 +41,7 @@ pub fn dry_run(release: &PreparedRelease) -> Result<Vec<String>> {
     )])
 }
 
-pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<String>> {
+pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
     let config = release
         .config
         .curseforge
@@ -53,11 +54,11 @@ pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<
         return Err("publish.curseforge.project must be a positive project ID".into());
     }
     let metadata = serde_json::to_string(&UploadMetadata {
-        changelog: release.changelog(root)?,
+        changelog: release.changelog()?.to_string(),
         changelog_type: "markdown".into(),
         display_name: format!("{} {}", release.lock.pack.name, release.lock.pack.version),
         game_version_names: vec![
-            loader_display_name(&release.lock.pack.loader),
+            loader_display_name(release.lock.pack.loader),
             release.lock.pack.minecraft.clone(),
         ],
         release_type: "release".into(),
@@ -90,12 +91,11 @@ pub fn publish(release: &PreparedRelease, root: &crate::PackRoot) -> Result<Vec<
     )])
 }
 
-fn loader_display_name(loader: &str) -> String {
+fn loader_display_name(loader: Loader) -> String {
     match loader {
-        "fabric" => "Fabric".into(),
-        "forge" => "Forge".into(),
-        "neoforge" => "NeoForge".into(),
-        other => other.to_string(),
+        Loader::Fabric => "Fabric".into(),
+        Loader::Forge => "Forge".into(),
+        Loader::NeoForge => "NeoForge".into(),
     }
 }
 
@@ -127,8 +127,8 @@ mod tests {
 
     #[test]
     fn names_the_selected_loader() {
-        assert_eq!(loader_display_name("fabric"), "Fabric");
-        assert_eq!(loader_display_name("neoforge"), "NeoForge");
-        assert_eq!(loader_display_name("custom"), "custom");
+        assert_eq!(loader_display_name(Loader::Fabric), "Fabric");
+        assert_eq!(loader_display_name(Loader::Forge), "Forge");
+        assert_eq!(loader_display_name(Loader::NeoForge), "NeoForge");
     }
 }

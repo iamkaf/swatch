@@ -20,7 +20,7 @@ struct Overrides {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
+pub(crate) struct Config {
     #[serde(default)]
     add: Vec<ExplicitFile>,
     #[serde(default)]
@@ -67,9 +67,12 @@ struct PackwizCurseForge {
     file_id: u32,
 }
 
-pub fn ensure_mappings(root: &PackRoot) -> Result<()> {
+pub fn ensure_mappings(
+    root: &PackRoot,
+    lock: Lockfile,
+    verified: &fetch::VerifiedFiles,
+) -> Result<Lockfile> {
     let config = load_config(root)?;
-    let mut lock = crate::load_lock(root)?;
     let excluded = validate_config(&config, &lock)?;
     let mapped: BTreeSet<_> = lock
         .curseforge
@@ -85,7 +88,7 @@ pub fn ensure_mappings(root: &PackRoot) -> Result<()> {
                 || mapped.contains(&(file.path.as_str(), file.sha1.as_str()))
         });
     if complete {
-        return Ok(());
+        return Ok(lock);
     }
 
     let packwiz = std::env::var_os("PACKWIZ_BIN").unwrap_or_else(|| "packwiz".into());
@@ -98,7 +101,7 @@ pub fn ensure_mappings(root: &PackRoot) -> Result<()> {
             && file.path.starts_with("mods/")
             && file.path.ends_with(".jar")
     }) {
-        let source = fetch::ensure_cached(root, file)?;
+        let source = verified.path(file)?;
         let destination = temp.path().join(&file.path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -139,7 +142,16 @@ pub fn ensure_mappings(root: &PackRoot) -> Result<()> {
         )?;
     }
 
-    lock.curseforge = mappings_from_packwiz(temp.path(), &lock)?;
+    let mappings = mappings_from_packwiz(temp.path(), &lock)?;
+    finish_mappings(lock, mappings, &excluded)
+}
+
+fn finish_mappings(
+    mut lock: Lockfile,
+    mappings: Vec<CurseForgeFile>,
+    excluded: &BTreeSet<String>,
+) -> Result<Lockfile> {
+    lock.curseforge = mappings;
     lock.curseforge
         .sort_by(|left, right| left.path.cmp(&right.path));
     let mapped: BTreeSet<_> = lock
@@ -157,7 +169,6 @@ pub fn ensure_mappings(root: &PackRoot) -> Result<()> {
         })
         .map(|file| file.path.clone())
         .collect();
-    fs::write(root.lock_toml(), lock.to_toml()?)?;
     if !unresolved.is_empty() {
         return Err(format!(
             "Packwiz could not map these CurseForge files: {}",
@@ -165,7 +176,8 @@ pub fn ensure_mappings(root: &PackRoot) -> Result<()> {
         )
         .into());
     }
-    Ok(())
+    lock.validate()?;
+    Ok(lock)
 }
 
 fn validate_config(config: &Config, lock: &Lockfile) -> Result<BTreeSet<String>> {
@@ -445,11 +457,14 @@ fn manifest_from_lock(
     })
 }
 
-pub fn export(root: &PackRoot, author: &str) -> Result<PathBuf> {
-    let lock = crate::load_lock(root)?;
-    let config = load_config(root)?;
-    let excluded = validate_config(&config, &lock)?;
-    let manifest = manifest_from_lock(&lock, author, &excluded)?;
+pub(crate) fn export_from_lock(
+    root: &PackRoot,
+    author: &str,
+    lock: &Lockfile,
+    config: &Config,
+) -> Result<PathBuf> {
+    let excluded = validate_config(config, lock)?;
+    let manifest = manifest_from_lock(lock, author, &excluded)?;
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     manifest_bytes.push(b'\n');
     let name = format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version);
@@ -476,7 +491,7 @@ fn write_archive(root: &PackRoot, destination: &Path, manifest: &[u8]) -> Result
     Ok(())
 }
 
-fn load_config(root: &PackRoot) -> Result<Config> {
+pub(crate) fn load_config(root: &PackRoot) -> Result<Config> {
     let path = root.path.join("overrides.toml");
     let text = fs::read_to_string(&path)
         .map_err(|error| crate::Error::from(format!("{}: {error}", path.display())))?;
@@ -492,7 +507,7 @@ fn toml_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{EnvSpec, FileSpec, PackMeta, SideRequirement};
+    use crate::spec::{EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
     use std::io::Read;
 
     fn lock(mapped: bool) -> Lockfile {
@@ -517,7 +532,7 @@ mod tests {
                 version: "1.2.0".into(),
                 group: "com.example.packs".into(),
                 minecraft: "26.2".into(),
-                loader: "fabric".into(),
+                loader: Loader::Fabric,
                 loader_version: "0.19.3".into(),
             },
             file: vec![file.clone()],
@@ -601,7 +616,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let mut pack = lock(true);
         pack.pack.name = "Other Pack".into();
-        pack.pack.loader = "neoforge".into();
+        pack.pack.loader = Loader::NeoForge;
         pack.pack.loader_version = "21.0.0".into();
         initialise_packwiz(temp.path(), &pack).expect("Packwiz metadata");
 
@@ -610,6 +625,30 @@ mod tests {
         assert!(metadata.contains("author = \"Swatch\""));
         assert!(metadata.contains("neoforge = \"21.0.0\""));
         assert!(!metadata.contains("fabric ="));
+    }
+
+    #[test]
+    fn every_loader_has_a_canonical_packwiz_name() {
+        for (loader, wire) in [
+            (Loader::Fabric, "fabric"),
+            (Loader::Forge, "forge"),
+            (Loader::NeoForge, "neoforge"),
+        ] {
+            let temp = tempfile::tempdir().expect("temporary directory");
+            let mut pack = lock(true);
+            pack.pack.loader = loader;
+            initialise_packwiz(temp.path(), &pack).expect("Packwiz metadata");
+            let metadata = fs::read_to_string(temp.path().join("pack.toml")).expect("pack.toml");
+            assert!(metadata.contains(&format!("{wire} = \"0.19.3\"")));
+        }
+    }
+
+    #[test]
+    fn unresolved_mappings_do_not_produce_a_candidate_lock() {
+        let error = finish_mappings(lock(false), Vec::new(), &no_exclusions())
+            .expect_err("unresolved mapping")
+            .to_string();
+        assert!(error.contains("mods/example.jar"));
     }
 
     #[test]
