@@ -48,34 +48,6 @@ struct PublishConfig {
 #[serde(deny_unknown_fields)]
 struct ModrinthConfig {
     project: String,
-    #[serde(default)]
-    status: ModrinthStatus,
-    #[serde(default)]
-    featured: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ModrinthStatus {
-    #[default]
-    Listed,
-    Unlisted,
-}
-
-impl ModrinthConfig {
-    fn featured(&self) -> bool {
-        self.featured
-            .unwrap_or(matches!(self.status, ModrinthStatus::Listed))
-    }
-}
-
-impl ModrinthStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Listed => "listed",
-            Self::Unlisted => "unlisted",
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,8 +152,6 @@ pub struct ReleaseCurseForgeTarget {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseModrinthTarget {
     pub project: String,
-    pub status: ModrinthStatus,
-    pub featured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,50 +321,124 @@ pub fn verify_release(root: &PackRoot) -> Result<ReleaseManifest> {
 
 /// Prepare once, then publish the same artifact bytes to every configured target.
 pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
-    let release = if mode == PublishMode::DryRun {
+    let (manifest, release) = if mode == PublishMode::DryRun {
         let release = prepare(root, ReleasePreparation::Preview)?;
         let manifest = manifest_from_release(root, &release, ReleasePreparation::Preview)?;
         let path = root.dist_dir().join("release.preview.json");
         let mut bytes = serde_json::to_vec_pretty(&manifest)?;
         bytes.push(b'\n');
         fs::write(path, bytes)?;
-        release
+        (manifest, release)
     } else {
-        load_prepared(root)?.1
+        load_prepared(root)?
     };
-    let mut output = Vec::new();
-    if release.config.maven.is_some() {
-        output.extend(if mode == PublishMode::DryRun {
-            maven_adapter::dry_run(&release)?
-        } else {
-            maven_adapter::publish(&release)?
-        });
-    }
-    if release.config.modrinth.is_some() {
-        output.extend(if mode == PublishMode::DryRun {
-            modrinth_adapter::dry_run(&release)?
-        } else {
-            modrinth_adapter::publish(&release)?
-        });
-    }
-    if release.config.curseforge.is_some() {
-        output.extend(if mode == PublishMode::DryRun {
-            curseforge_adapter::dry_run(&release)?
-        } else {
-            curseforge_adapter::publish(&release)?
-        });
-    }
-    if release.config.github.is_some() {
-        output.extend(if mode == PublishMode::DryRun {
-            github_adapter::dry_run(&release)?
-        } else {
-            github_adapter::publish(&release)?
-        });
-    }
+    let mut output = dispatch_publish_targets(
+        &release.config,
+        mode,
+        |name| {
+            std::env::var(name)
+                .ok()
+                .is_some_and(|value| !value.is_empty())
+        },
+        |target| match (mode, target) {
+            (PublishMode::DryRun, PublishTarget::GitHub) => github_adapter::dry_run(&release),
+            (PublishMode::DryRun, PublishTarget::Maven) => maven_adapter::dry_run(&release),
+            (PublishMode::DryRun, PublishTarget::Modrinth) => modrinth_adapter::dry_run(&release),
+            (PublishMode::DryRun, PublishTarget::CurseForge) => {
+                curseforge_adapter::dry_run(&release)
+            }
+            (PublishMode::Publish, PublishTarget::GitHub) => {
+                let input = github_adapter::preflight(root, manifest.source_revision.as_deref())?;
+                github_adapter::publish(&release, &input)
+            }
+            (PublishMode::Publish, PublishTarget::Maven) => maven_adapter::publish(&release),
+            (PublishMode::Publish, PublishTarget::Modrinth) => modrinth_adapter::publish(&release),
+            (PublishMode::Publish, PublishTarget::CurseForge) => {
+                curseforge_adapter::publish(&release)
+            }
+        },
+    )?;
     if output.is_empty() {
         output.push("prepared release locally; no publish targets are configured".into());
     }
     Ok(output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishTarget {
+    GitHub,
+    Maven,
+    Modrinth,
+    CurseForge,
+}
+
+const PUBLISH_ORDER: [PublishTarget; 4] = [
+    PublishTarget::GitHub,
+    PublishTarget::Maven,
+    PublishTarget::Modrinth,
+    PublishTarget::CurseForge,
+];
+
+fn dispatch_publish_targets(
+    config: &PublishConfig,
+    mode: PublishMode,
+    credential_is_set: impl Fn(&str) -> bool,
+    mut publish_target: impl FnMut(PublishTarget) -> Result<Vec<String>>,
+) -> Result<Vec<String>> {
+    if mode == PublishMode::Publish {
+        validate_publish_credentials(config, credential_is_set)?;
+    }
+
+    let mut output = Vec::new();
+    for target in configured_targets(config) {
+        output.extend(publish_target(target)?);
+    }
+    Ok(output)
+}
+
+fn configured_targets(config: &PublishConfig) -> impl Iterator<Item = PublishTarget> + '_ {
+    PUBLISH_ORDER.into_iter().filter(|target| match target {
+        PublishTarget::GitHub => config.github.is_some(),
+        PublishTarget::Maven => config.maven.is_some(),
+        PublishTarget::Modrinth => config.modrinth.is_some(),
+        PublishTarget::CurseForge => config.curseforge.is_some(),
+    })
+}
+
+fn validate_publish_credentials(
+    config: &PublishConfig,
+    credential_is_set: impl Fn(&str) -> bool,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    if config.github.is_some()
+        && !credential_is_set("GITHUB_TOKEN")
+        && !credential_is_set("GH_TOKEN")
+    {
+        missing.push("GitHub: set GITHUB_TOKEN (or GH_TOKEN)");
+    }
+    if config.maven.is_some() {
+        if !credential_is_set("MAVEN_PUBLISH_USERNAME") {
+            missing.push("Maven: set MAVEN_PUBLISH_USERNAME");
+        }
+        if !credential_is_set("MAVEN_PUBLISH_PASSWORD") {
+            missing.push("Maven: set MAVEN_PUBLISH_PASSWORD");
+        }
+    }
+    if config.modrinth.is_some() && !credential_is_set("MODRINTH_TOKEN") {
+        missing.push("Modrinth: set MODRINTH_TOKEN");
+    }
+    if config.curseforge.is_some() && !credential_is_set("CURSEFORGE_TOKEN") {
+        missing.push("CurseForge: set CURSEFORGE_TOKEN");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "cannot publish because configured target credentials are missing:\n  - {}\nno files were uploaded",
+        missing.join("\n  - ")
+    )
+    .into())
 }
 
 fn load_config(text: &str) -> Result<PublishConfig> {
@@ -695,8 +739,6 @@ fn release_targets(config: &PublishConfig, preparation: ReleasePreparation) -> R
             .as_ref()
             .map(|modrinth| ReleaseModrinthTarget {
                 project: modrinth.project.clone(),
-                status: modrinth.status,
-                featured: modrinth.featured(),
             }),
         curseforge: config
             .curseforge
@@ -1095,7 +1137,6 @@ repository = "example/example-pack"
         let mut config = load_config(
             r#"[publish.modrinth]
 project = "modrinth-project"
-status = "unlisted"
 
 [publish.curseforge]
 project = 123
@@ -1118,8 +1159,6 @@ repository = "https://maven.example.invalid/releases///"
                 github: Some("example/example-pack".into()),
                 modrinth: Some(ReleaseModrinthTarget {
                     project: "modrinth-project".into(),
-                    status: ModrinthStatus::Unlisted,
-                    featured: false,
                 }),
                 curseforge: Some(ReleaseCurseForgeTarget {
                     project: 123,
@@ -1132,6 +1171,88 @@ repository = "https://maven.example.invalid/releases///"
             artifact_media_type(ArtifactKind::CurseForge),
             "application/zip"
         );
+    }
+
+    #[test]
+    fn live_publish_checks_every_credential_before_running_an_adapter() {
+        let config = load_config(
+            r#"[publish.github]
+repository = "example/example-pack"
+
+[publish.maven]
+repository = "https://maven.example.invalid/releases"
+
+[publish.modrinth]
+project = "modrinth-project"
+
+[publish.curseforge]
+project = 123
+author = "Example Author"
+"#,
+        )
+        .expect("publish config");
+        let mut adapter_calls = Vec::new();
+        let error = dispatch_publish_targets(
+            &config,
+            PublishMode::Publish,
+            |name| name == "MAVEN_PUBLISH_USERNAME",
+            |target| {
+                adapter_calls.push(target);
+                Ok(Vec::new())
+            },
+        )
+        .expect_err("missing credentials")
+        .to_string();
+
+        assert!(adapter_calls.is_empty());
+        assert!(error.contains("GitHub: set GITHUB_TOKEN (or GH_TOKEN)"));
+        assert!(error.contains("Maven: set MAVEN_PUBLISH_PASSWORD"));
+        assert!(error.contains("Modrinth: set MODRINTH_TOKEN"));
+        assert!(error.contains("CurseForge: set CURSEFORGE_TOKEN"));
+        assert!(error.contains("no files were uploaded"));
+        assert!(!error.contains("MAVEN_PUBLISH_USERNAME"));
+    }
+
+    #[test]
+    fn dry_run_skips_credentials_and_uses_safe_publish_order() {
+        let config = load_config(
+            r#"[publish.github]
+repository = "example/example-pack"
+
+[publish.maven]
+repository = "https://maven.example.invalid/releases"
+
+[publish.modrinth]
+project = "modrinth-project"
+
+[publish.curseforge]
+project = 123
+author = "Example Author"
+"#,
+        )
+        .expect("publish config");
+        let mut adapter_calls = Vec::new();
+        dispatch_publish_targets(
+            &config,
+            PublishMode::DryRun,
+            |_| panic!("dry-run must not inspect credentials"),
+            |target| {
+                adapter_calls.push(target);
+                Ok(Vec::new())
+            },
+        )
+        .expect("dry-run dispatch");
+
+        assert_eq!(
+            adapter_calls,
+            [
+                PublishTarget::GitHub,
+                PublishTarget::Maven,
+                PublishTarget::Modrinth,
+                PublishTarget::CurseForge,
+            ]
+        );
+        assert_eq!(PUBLISH_ORDER.last(), Some(&PublishTarget::CurseForge));
     }
 
     #[test]
