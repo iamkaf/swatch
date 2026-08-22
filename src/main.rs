@@ -30,6 +30,13 @@ fn run(args: Vec<String>) -> swatch::Result<()> {
         print_help();
         return Ok(());
     }
+    if matches!(command.as_str(), "-V" | "--version") {
+        if !args.is_empty() {
+            return Err(format!("invalid version arguments; use `{TOOL_NAME} --version`").into());
+        }
+        println!("{TOOL_NAME} {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let root = PackRoot::discover(&env::current_dir()?)?;
     match command.as_str() {
         "add" => {
@@ -288,6 +295,7 @@ Minecraft pack authoring tool
   swatch verify              Verify every prepared artifact without credentials
   swatch publish --dry-run   Write dist/release.preview.json and show upload details
   swatch publish             Publish the verified dist/release.json snapshot
+  swatch --version, -V       Print the installed Swatch version
 "
     );
 }
