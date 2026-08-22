@@ -14,6 +14,7 @@ struct VersionData<'a> {
     changelog: &'a str,
     dependencies: Vec<()>,
     version_type: &'a str,
+    featured: bool,
     loaders: &'a [String],
     game_versions: &'a [String],
     project_id: &'a str,
@@ -81,6 +82,7 @@ pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
         changelog,
         dependencies: Vec::new(),
         version_type: "release",
+        featured: false,
         loaders: &loaders,
         game_versions: &game_versions,
         project_id: &config.project,
@@ -169,6 +171,7 @@ mod tests {
             changelog: "Notes",
             dependencies: Vec::new(),
             version_type: "release",
+            featured: false,
             loaders: &["fabric".into()],
             game_versions: &["26.2".into()],
             project_id: "example",
@@ -184,12 +187,19 @@ mod tests {
                 "changelog": "Notes",
                 "dependencies": [],
                 "version_type": "release",
+                "featured": false,
                 "loaders": ["fabric"],
                 "game_versions": ["26.2"],
                 "project_id": "example",
                 "file_parts": ["file"],
                 "primary_file": "file"
             })
+        );
+        assert!(
+            !json
+                .as_object()
+                .expect("version object")
+                .contains_key("status")
         );
     }
 }
