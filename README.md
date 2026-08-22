@@ -2,7 +2,7 @@
 
 Swatch turns a small, exact-pinned Minecraft pack manifest into locked client and server archives. It also records the hashes of authored files, prepares release bytes once, verifies them without credentials, and publishes the verified files to configured destinations.
 
-The manifest, lockfile, and `release.json` formats are experimental. Swatch will keep reading the current v2 lockfile while packs migrate to v3, but other format changes may be breaking until the tool has been exercised by more real packs.
+The manifest, lockfile, and `release.json` formats are experimental. They may change until Swatch has been exercised by more real packs.
 
 ## Build and install
 
@@ -87,7 +87,7 @@ Use the three authored roots for files that are not downloaded dependencies:
 - `client-overrides/` is client-only.
 - `server-overrides/` is server-only.
 
-`swatch install` records each file's relative path, size, SHA-1, and SHA-512 in lockfile v3. Builds and publication stop if a file changes, appears, or disappears. Run `swatch install` only after reviewing an intended authored-file change. Symbolic links and editor or operating-system junk files are rejected.
+`swatch install` records each file's relative path, size, SHA-1, and SHA-512 in lockfile version 1. Builds and publication stop if a file changes, appears, or disappears. Run `swatch install` only after reviewing an intended authored-file change. Symbolic links and editor or operating-system junk files are rejected.
 
 ## Build client and server archives
 
@@ -121,7 +121,7 @@ The existing preview remains available:
 swatch publish --dry-run
 ```
 
-It prepares a local preview and prints configured upload targets without using credentials. A live publish reads platform credentials only after `swatch prepare` has succeeded. See [MIGRATION.md](./MIGRATION.md) for the v2 lockfile and publication changes.
+It prepares a local preview and prints configured upload targets without using credentials. A live publish reads platform credentials only after `swatch prepare` has succeeded.
 
 ## CurseForge mappings
 

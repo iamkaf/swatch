@@ -2,6 +2,9 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+const PACK_MANIFEST_FORMAT: u32 = 1;
+const LOCKFILE_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SideRequirement {
@@ -218,7 +221,7 @@ impl PackSpec {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format != 1 {
+        if self.format != PACK_MANIFEST_FORMAT {
             return Err(format!("unsupported pack.toml format {}", self.format).into());
         }
         validate_pack_meta(&self.pack)?;
@@ -362,7 +365,7 @@ impl AuthoredFile {
 impl Lockfile {
     pub fn new(pack: PackMeta, file: Vec<FileSpec>) -> Self {
         Self {
-            version: 3,
+            version: LOCKFILE_VERSION,
             pack,
             file,
             authored: Vec::new(),
@@ -371,7 +374,6 @@ impl Lockfile {
     }
 
     pub fn set_authored(&mut self, authored: Vec<AuthoredFile>) {
-        self.version = 3;
         self.authored = authored;
     }
 
@@ -397,7 +399,7 @@ impl Lockfile {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 2 | 3) {
+        if self.version != LOCKFILE_VERSION {
             return Err(format!("unsupported lock version {}", self.version).into());
         }
         validate_pack_meta(&self.pack)?;
@@ -420,12 +422,6 @@ impl Lockfile {
                     format!("duplicate authored file {:?}/{}", file.root, file.path).into(),
                 );
             }
-        }
-        if self.version == 2 && !self.authored.is_empty() {
-            return Err(
-                "lock version 2 cannot contain authored files; run `swatch install` to migrate"
-                    .into(),
-            );
         }
         let pins: BTreeSet<_> = self
             .file
@@ -753,21 +749,15 @@ data = "1"
     }
 
     #[test]
-    fn reads_v2_locks_and_migrates_them_mechanically() {
+    fn lockfile_contract_is_version_one_only() {
         let mut lock = valid_lock(Loader::Fabric);
-        lock.version = 2;
-        let text = lock.to_toml().expect("v2 lock TOML");
-        let mut parsed = Lockfile::parse(&text).expect("read v2 lock");
-        assert_eq!(parsed.version, 2);
-        assert!(parsed.authored.is_empty());
-
-        parsed.set_authored(Vec::new());
-        assert_eq!(parsed.version, 3);
         assert!(
-            parsed
-                .to_toml()
-                .expect("v3 lock TOML")
-                .starts_with("version = 3")
+            lock.to_toml()
+                .expect("version 1 lock")
+                .starts_with("version = 1")
         );
+
+        lock.version = 2;
+        assert!(lock.to_toml().is_err());
     }
 }

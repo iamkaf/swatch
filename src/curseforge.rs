@@ -526,7 +526,7 @@ mod tests {
             downloads: vec!["https://example.invalid/example.jar".into()],
         };
         Lockfile {
-            version: 2,
+            version: 1,
             pack: PackMeta {
                 name: "Example Pack".into(),
                 slug: "example-pack".into(),

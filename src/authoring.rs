@@ -316,7 +316,7 @@ loader_version = "0.19.3"
 
         install(&root, InstallOptions::default()).expect("install");
         let lock = crate::load_lock(&root).expect("lockfile");
-        assert_eq!(lock.version, 3);
+        assert_eq!(lock.version, 1);
         assert_eq!(lock.authored.len(), 1);
         crate::build(&root, crate::BuildSide::Client).expect("locked build");
 

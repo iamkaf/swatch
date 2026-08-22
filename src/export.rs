@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn index_omits_nothing_and_sorts() {
         let lock = Lockfile {
-            version: 2,
+            version: 1,
             pack: PackMeta {
                 name: "Example Pack".into(),
                 slug: "example-pack".into(),
