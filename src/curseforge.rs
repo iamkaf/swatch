@@ -456,11 +456,12 @@ fn manifest_from_lock(
     })
 }
 
-pub(crate) fn export_from_lock(
+pub(crate) fn export_from_lock_to(
     root: &PackRoot,
     author: &str,
     lock: &Lockfile,
     config: &Config,
+    output_dir: &Path,
 ) -> Result<PathBuf> {
     crate::authored::verify(root, &lock.authored)?;
     let excluded = validate_config(config, lock)?;
@@ -468,8 +469,8 @@ pub(crate) fn export_from_lock(
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     manifest_bytes.push(b'\n');
     let name = format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version);
-    fs::create_dir_all(root.dist_dir())?;
-    let destination = root.dist_dir().join(&name);
+    fs::create_dir_all(output_dir)?;
+    let destination = output_dir.join(&name);
     write_archive(root, &destination, &manifest_bytes)?;
     crate::authored::verify(root, &lock.authored)?;
     Ok(destination)

@@ -57,7 +57,9 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
         );
     }
 
-    let archive_path = root.dist_dir().join("copper-valley-0.1.0-client.mrpack");
+    let archive_path = root
+        .dist_dir()
+        .join("preview/copper-valley-0.1.0-client.mrpack");
     let archive = File::open(&archive_path).expect("open prepared mrpack");
     let mut archive = ZipArchive::new(archive).expect("read prepared mrpack");
     let mut index = String::new();
@@ -76,7 +78,9 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
             .any(|file| file["path"] == "mods/dedicated-fixture.jar")
     );
 
-    let server_path = root.dist_dir().join("copper-valley-0.1.0-server.mrpack");
+    let server_path = root
+        .dist_dir()
+        .join("preview/copper-valley-0.1.0-server.mrpack");
     let mut server = ZipArchive::new(File::open(server_path).expect("server archive"))
         .expect("read server archive");
     let mut server_index = String::new();
@@ -100,12 +104,21 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
     );
 
     let release: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.dist_dir().join("release.json")).expect("release manifest"),
+        &fs::read(root.dist_dir().join("release.preview.json")).expect("release manifest"),
     )
     .expect("parse release manifest");
     assert_eq!(release["schemaVersion"], 1);
     assert_eq!(release["packVersion"], "0.1.0");
     assert_eq!(release["preparationMode"], "preview");
+    assert!(
+        release["artifacts"]
+            .as_array()
+            .expect("release artifacts")
+            .iter()
+            .all(|artifact| artifact["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("dist/preview/")))
+    );
     assert!(
         release["artifacts"]
             .as_array()
@@ -121,10 +134,14 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
 
     assert!(
         root.dist_dir()
-            .join("copper-valley-0.1.0-curseforge.zip")
+            .join("preview/copper-valley-0.1.0-curseforge.zip")
             .is_file()
     );
-    assert!(root.dist_dir().join("copper-valley-0.1.0.pom").is_file());
+    assert!(
+        root.dist_dir()
+            .join("preview/copper-valley-0.1.0.pom")
+            .is_file()
+    );
 }
 
 fn offline_command(binary: &str, root: &Path) -> Command {

@@ -66,8 +66,17 @@ pub(crate) fn export_from_lock(
     lock: &Lockfile,
     side: BuildSide,
 ) -> Result<std::path::PathBuf> {
+    export_from_lock_to(root, lock, side, &root.dist_dir())
+}
+
+pub(crate) fn export_from_lock_to(
+    root: &PackRoot,
+    lock: &Lockfile,
+    side: BuildSide,
+    output_dir: &Path,
+) -> Result<std::path::PathBuf> {
     crate::authored::verify(root, &lock.authored)?;
-    fs::create_dir_all(root.dist_dir())?;
+    fs::create_dir_all(output_dir)?;
     let index = index_from_lock(lock, side)?;
     let index_bytes = serde_json::to_vec_pretty(&index)?;
     let mut index_bytes = index_bytes;
@@ -80,7 +89,7 @@ pub(crate) fn export_from_lock(
         lock.pack.version,
         side.as_str()
     );
-    let dest = root.dist_dir().join(&name);
+    let dest = output_dir.join(&name);
     write_mrpack(&dest, &index_bytes, root, side)?;
     crate::authored::verify(root, &lock.authored)?;
     Ok(dest)

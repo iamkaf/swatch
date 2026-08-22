@@ -286,7 +286,7 @@ Minecraft pack authoring tool
   swatch build all           Build both archives
   swatch prepare             Prepare artifacts and write dist/release.json
   swatch verify              Verify every prepared artifact without credentials
-  swatch publish --dry-run   Write an unpublishable preview and show upload details
+  swatch publish --dry-run   Write dist/release.preview.json and show upload details
   swatch publish             Publish the verified dist/release.json snapshot
 "
     );

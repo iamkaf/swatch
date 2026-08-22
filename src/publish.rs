@@ -186,19 +186,34 @@ fn prepare(root: &PackRoot, mode: ReleasePreparation) -> Result<PreparedRelease>
     } else {
         None
     };
-    fs::create_dir_all(root.dist_dir())?;
+    let output_dir = match mode {
+        ReleasePreparation::Strict => root.dist_dir(),
+        ReleasePreparation::Preview => root.dist_dir().join("preview"),
+    };
+    fs::create_dir_all(&output_dir)?;
 
-    let mrpack = crate::export::export_from_lock(root, &lock, crate::export::BuildSide::Client)?;
+    let mrpack = crate::export::export_from_lock_to(
+        root,
+        &lock,
+        crate::export::BuildSide::Client,
+        &output_dir,
+    )?;
     let mut artifacts = vec![artifact(&mrpack, ArtifactKind::Modrinth)?];
-    let server = crate::export::export_from_lock(root, &lock, crate::export::BuildSide::Server)?;
+    let server = crate::export::export_from_lock_to(
+        root,
+        &lock,
+        crate::export::BuildSide::Server,
+        &output_dir,
+    )?;
     artifacts.push(artifact(&server, ArtifactKind::Server)?);
     if let Some(curseforge_config) = &config.curseforge {
         let overrides = crate::curseforge::load_config(root)?;
-        let curseforge = crate::curseforge::export_from_lock(
+        let curseforge = crate::curseforge::export_from_lock_to(
             root,
             &curseforge_config.author,
             &lock,
             &overrides,
+            &output_dir,
         )?;
         artifacts.push(artifact(&curseforge, ArtifactKind::CurseForge)?);
     }
@@ -207,7 +222,7 @@ fn prepare(root: &PackRoot, mode: ReleasePreparation) -> Result<PreparedRelease>
             return Err("publish.maven.repository must use HTTPS".into());
         }
         let pom_name = format!("{}-{}.pom", lock.pack.slug, lock.pack.version);
-        let pom = root.dist_dir().join(&pom_name);
+        let pom = output_dir.join(&pom_name);
         fs::write(
             &pom,
             minimal_pom(
@@ -219,7 +234,7 @@ fn prepare(root: &PackRoot, mode: ReleasePreparation) -> Result<PreparedRelease>
         )?;
         artifacts.push(artifact(&pom, ArtifactKind::Maven)?);
 
-        let metadata = root.dist_dir().join("maven-metadata.xml");
+        let metadata = output_dir.join("maven-metadata.xml");
         fs::write(
             &metadata,
             prepare_maven_metadata(&lock, &maven.repository, mode)?,
@@ -227,7 +242,7 @@ fn prepare(root: &PackRoot, mode: ReleasePreparation) -> Result<PreparedRelease>
         artifacts.push(artifact(&metadata, ArtifactKind::MavenMetadata)?);
     }
     if let Some(changelog) = &changelog {
-        let notes = root.dist_dir().join("release-notes.md");
+        let notes = output_dir.join("release-notes.md");
         fs::write(&notes, changelog)?;
         artifacts.push(artifact(&notes, ArtifactKind::ReleaseNotes)?);
     }
@@ -261,7 +276,7 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
     let release = if mode == PublishMode::DryRun {
         let release = prepare(root, ReleasePreparation::Preview)?;
         let manifest = manifest_from_release(root, &release, ReleasePreparation::Preview)?;
-        let path = root.dist_dir().join("release.json");
+        let path = root.dist_dir().join("release.preview.json");
         let mut bytes = serde_json::to_vec_pretty(&manifest)?;
         bytes.push(b'\n');
         fs::write(path, bytes)?;
@@ -269,6 +284,9 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
     } else {
         load_prepared(root)?.1
     };
+    if mode == PublishMode::Publish && release.config.maven.is_some() {
+        maven_adapter::reject_live_publish(&release)?;
+    }
     let mut output = Vec::new();
     if release.config.modrinth.is_some() {
         output.extend(if mode == PublishMode::DryRun {
@@ -291,12 +309,8 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
             github_adapter::publish(&release)?
         });
     }
-    if release.config.maven.is_some() {
-        output.extend(if mode == PublishMode::DryRun {
-            maven_adapter::dry_run(&release)?
-        } else {
-            maven_adapter::publish(&release)?
-        });
+    if mode == PublishMode::DryRun && release.config.maven.is_some() {
+        output.extend(maven_adapter::dry_run(&release)?);
     }
     if output.is_empty() {
         output.push("prepared release locally; no publish targets are configured".into());
@@ -331,11 +345,15 @@ fn manifest_from_release(
     release: &PreparedRelease,
     preparation: ReleasePreparation,
 ) -> Result<ReleaseManifest> {
+    let artifact_root = match preparation {
+        ReleasePreparation::Strict => "dist",
+        ReleasePreparation::Preview => "dist/preview",
+    };
     let mut artifacts = Vec::with_capacity(release.artifacts.len());
     for artifact in &release.artifacts {
         artifacts.push(ReleaseArtifact {
             role: artifact_role(artifact.kind).into(),
-            path: format!("dist/{}", artifact.name),
+            path: format!("{artifact_root}/{}", artifact.name),
             media_type: artifact_media_type(artifact.kind).into(),
             sha256: artifact.sha256.clone(),
             sha512: artifact.sha512.clone(),
@@ -889,7 +907,7 @@ repository = "example/example-pack"
     }
 
     #[test]
-    fn maven_preview_cannot_be_verified_or_published() {
+    fn maven_preview_preserves_prior_strict_metadata() {
         let (_directory, root, _lock) = release_root();
         let manifest = fs::read_to_string(root.pack_toml())
             .expect("read manifest")
@@ -913,12 +931,23 @@ repository = "example/example-pack"
 
         publish(&root, PublishMode::DryRun).expect("Maven preview");
         let preview: ReleaseManifest = serde_json::from_slice(
-            &fs::read(root.dist_dir().join("release.json")).expect("preview manifest"),
+            &fs::read(root.dist_dir().join("release.preview.json")).expect("preview manifest"),
         )
         .expect("parse preview manifest");
         assert_eq!(preview.preparation_mode, ReleasePreparation::Preview);
         assert!(
-            !fs::read_to_string(metadata_path)
+            fs::read_to_string(metadata_path)
+                .expect("strict metadata")
+                .contains("0.9.0")
+        );
+        assert!(
+            preview
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.path.starts_with("dist/preview/"))
+        );
+        assert!(
+            !fs::read_to_string(root.dist_dir().join("preview/maven-metadata.xml"))
                 .expect("preview metadata")
                 .contains("0.9.0")
         );
@@ -926,11 +955,81 @@ repository = "example/example-pack"
         let verify_error = verify_release(&root)
             .expect_err("preview verification")
             .to_string();
-        assert!(verify_error.contains("preview"));
+        assert!(verify_error.contains("run `swatch prepare` first"));
         let publish_error = publish(&root, PublishMode::Publish)
             .expect_err("preview publication")
             .to_string();
-        assert!(publish_error.contains("preview"));
+        assert!(publish_error.contains("run `swatch prepare` first"));
+    }
+
+    #[test]
+    fn dry_run_preserves_a_strict_release_snapshot() {
+        let (_directory, root, _lock) = release_root();
+        let strict_path = prepare_release(&root).expect("prepare strict release");
+        let strict_bytes = fs::read(&strict_path).expect("strict release JSON");
+
+        publish(&root, PublishMode::DryRun).expect("publication preview");
+
+        assert_eq!(
+            fs::read(&strict_path).expect("strict release JSON after preview"),
+            strict_bytes
+        );
+        let preview: ReleaseManifest = serde_json::from_slice(
+            &fs::read(root.dist_dir().join("release.preview.json")).expect("preview release JSON"),
+        )
+        .expect("parse preview release JSON");
+        assert_eq!(preview.preparation_mode, ReleasePreparation::Preview);
+        assert!(
+            preview
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.path.starts_with("dist/preview/"))
+        );
+        verify_release(&root).expect("strict snapshot still verifies");
+    }
+
+    #[test]
+    fn maven_rejection_precedes_other_platform_uploads() {
+        let (_directory, root, _lock) = release_root();
+        let manifest = fs::read_to_string(root.pack_toml()).expect("read manifest");
+        fs::write(
+            root.pack_toml(),
+            format!(
+                "{manifest}\n[publish.maven]\nrepository = \"https://example.invalid/maven\"\n"
+            ),
+        )
+        .expect("write Maven publish target");
+        let mut release = prepare(&root, ReleasePreparation::Preview).expect("prepare release");
+        let metadata = release
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.kind == ArtifactKind::MavenMetadata)
+            .expect("Maven metadata");
+        metadata.bytes = metadata_xml(
+            "org.example.packs",
+            "example-pack",
+            "1.0.0",
+            &["0.9.0".into(), "1.0.0".into()],
+        )
+        .into_bytes();
+        metadata.sha256 = hash::sha256_hex(&metadata.bytes);
+        metadata.sha512 = hash::sha512_hex(&metadata.bytes);
+        for artifact in &release.artifacts {
+            fs::write(root.dist_dir().join(&artifact.name), &artifact.bytes)
+                .expect("write strict artifact");
+        }
+        let strict = manifest_from_release(&root, &release, ReleasePreparation::Strict)
+            .expect("strict manifest");
+        let mut strict_bytes = serde_json::to_vec_pretty(&strict).expect("strict JSON");
+        strict_bytes.push(b'\n');
+        fs::write(root.dist_dir().join("release.json"), strict_bytes)
+            .expect("write strict manifest");
+
+        let error = publish(&root, PublishMode::Publish)
+            .expect_err("Maven live publication")
+            .to_string();
+        assert!(error.contains("no files were uploaded"));
+        assert!(!error.contains("GITHUB_TOKEN"));
     }
 
     #[test]
