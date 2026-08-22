@@ -12,11 +12,12 @@ struct VersionData<'a> {
     name: &'a str,
     version_number: &'a str,
     changelog: &'a str,
+    dependencies: Vec<()>,
     version_type: &'a str,
     loaders: &'a [String],
     game_versions: &'a [String],
     featured: bool,
-    status: &'static str,
+    status: &'a str,
     project_id: &'a str,
     file_parts: Vec<String>,
     primary_file: String,
@@ -80,11 +81,12 @@ pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
         name: &format!("{} {}", release.lock.pack.name, release.lock.pack.version),
         version_number: &release.lock.pack.version,
         changelog,
+        dependencies: Vec::new(),
         version_type: "release",
         loaders: &loaders,
         game_versions: &game_versions,
-        featured: true,
-        status: "listed",
+        featured: config.featured(),
+        status: config.status.as_str(),
         project_id: &config.project,
         file_parts: vec!["file".into()],
         primary_file: "file".into(),
@@ -161,5 +163,25 @@ mod tests {
     #[test]
     fn creates_versions_at_the_modrinth_version_endpoint() {
         assert_eq!(create_version_url(), "https://api.modrinth.com/v2/version");
+    }
+
+    #[test]
+    fn includes_the_required_empty_dependency_list() {
+        let data = VersionData {
+            name: "Example Pack 1.0.0",
+            version_number: "1.0.0",
+            changelog: "Notes",
+            dependencies: Vec::new(),
+            version_type: "release",
+            loaders: &["fabric".into()],
+            game_versions: &["26.2".into()],
+            featured: false,
+            status: "listed",
+            project_id: "example",
+            file_parts: vec!["file".into()],
+            primary_file: "file".into(),
+        };
+        let json = serde_json::to_value(data).expect("version JSON");
+        assert_eq!(json["dependencies"], serde_json::json!([]));
     }
 }

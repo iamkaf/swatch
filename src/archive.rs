@@ -3,6 +3,16 @@ use crate::spec::check_pack_path;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use zip::{DateTime, write::SimpleFileOptions};
+
+pub(crate) fn zip_options() -> Result<SimpleFileOptions> {
+    let timestamp = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .map_err(|_| crate::Error::from("invalid fixed archive timestamp"))?;
+    Ok(SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(timestamp)
+        .unix_permissions(0o644))
+}
 
 pub(crate) fn collect_tree(
     dir: PathBuf,
@@ -18,13 +28,6 @@ pub(crate) fn collect_tree(
 fn collect_dir(dir: &Path, prefix: &str, output: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == ".DS_Store" || name.starts_with("._") || name.ends_with(".bak") {
-            continue;
-        }
-        let archive_path = format!("{prefix}/{name}");
-        check_pack_path(&archive_path)?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
@@ -34,6 +37,27 @@ fn collect_dir(dir: &Path, prefix: &str, output: &mut BTreeMap<String, Vec<u8>>)
             )
             .into());
         }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".gitkeep" && metadata.len() == 0 {
+            continue;
+        }
+        if name == ".gitkeep" {
+            return Err(format!(
+                "authored placeholder must be empty: {}",
+                entry.path().display()
+            )
+            .into());
+        }
+        if crate::authored::is_junk(&name) {
+            return Err(format!(
+                "remove junk file from authored content: {}",
+                entry.path().display()
+            )
+            .into());
+        }
+        let archive_path = format!("{prefix}/{name}");
+        check_pack_path(&archive_path)?;
         if metadata.is_dir() {
             collect_dir(&path, &archive_path, output)?;
         } else if metadata.is_file()

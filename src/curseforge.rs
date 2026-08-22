@@ -8,7 +8,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
 
 const CURSEFORGE_MANIFEST_VERSION: u32 = 1;
 
@@ -457,20 +456,23 @@ fn manifest_from_lock(
     })
 }
 
-pub(crate) fn export_from_lock(
+pub(crate) fn export_from_lock_to(
     root: &PackRoot,
     author: &str,
     lock: &Lockfile,
     config: &Config,
+    output_dir: &Path,
 ) -> Result<PathBuf> {
+    crate::authored::verify(root, &lock.authored)?;
     let excluded = validate_config(config, lock)?;
     let manifest = manifest_from_lock(lock, author, &excluded)?;
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     manifest_bytes.push(b'\n');
     let name = format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version);
-    fs::create_dir_all(root.dist_dir())?;
-    let destination = root.dist_dir().join(&name);
+    fs::create_dir_all(output_dir)?;
+    let destination = output_dir.join(&name);
     write_archive(root, &destination, &manifest_bytes)?;
+    crate::authored::verify(root, &lock.authored)?;
     Ok(destination)
 }
 
@@ -480,7 +482,7 @@ fn write_archive(root: &PackRoot, destination: &Path, manifest: &[u8]) -> Result
     crate::archive::collect_tree(root.client_overrides_dir(), "overrides", &mut entries)?;
     let file = File::create(destination)?;
     let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options = crate::archive::zip_options()?;
     zip.start_file("manifest.json", options)?;
     zip.write_all(manifest)?;
     for (path, bytes) in entries {
@@ -525,7 +527,7 @@ mod tests {
             downloads: vec!["https://example.invalid/example.jar".into()],
         };
         Lockfile {
-            version: 2,
+            version: 1,
             pack: PackMeta {
                 name: "Example Pack".into(),
                 slug: "example-pack".into(),
@@ -536,6 +538,7 @@ mod tests {
                 loader_version: "0.19.3".into(),
             },
             file: vec![file.clone()],
+            authored: Vec::new(),
             curseforge: mapped
                 .then_some(CurseForgeFile {
                     path: file.path,
@@ -683,6 +686,12 @@ mod tests {
         manifest_bytes.push(b'\n');
         let destination = temp.path().join("pack.zip");
         write_archive(&root, &destination, &manifest_bytes).expect("archive");
+        let first_bytes = fs::read(&destination).expect("first archive bytes");
+        fs::write(root.overrides_dir().join("config/common.txt"), b"common")
+            .expect("rewrite common file");
+        let second = temp.path().join("pack-again.zip");
+        write_archive(&root, &second, &manifest_bytes).expect("second archive");
+        assert_eq!(first_bytes, fs::read(second).expect("second archive bytes"));
 
         let file = File::open(destination).expect("archive file");
         let mut zip = zip::ZipArchive::new(file).expect("zip");

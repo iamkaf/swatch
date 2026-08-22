@@ -2,6 +2,9 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+const PACK_MANIFEST_FORMAT: u32 = 1;
+const LOCKFILE_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SideRequirement {
@@ -87,6 +90,8 @@ pub enum ContentPlacement {
     ClientMod,
     ServerMod,
     Shader,
+    ResourcePack,
+    DataPack,
 }
 
 impl ContentPlacement {
@@ -96,6 +101,8 @@ impl ContentPlacement {
             Self::ClientMod => "client_mods",
             Self::ServerMod => "server_mods",
             Self::Shader => "shaders",
+            Self::ResourcePack => "resource_packs",
+            Self::DataPack => "datapacks",
         }
     }
 
@@ -103,6 +110,8 @@ impl ContentPlacement {
         match self {
             Self::SharedMod | Self::ClientMod | Self::ServerMod => "mods",
             Self::Shader => "shaderpacks",
+            Self::ResourcePack => "resourcepacks",
+            Self::DataPack => "datapacks",
         }
     }
 
@@ -110,6 +119,8 @@ impl ContentPlacement {
         match self {
             Self::SharedMod | Self::ClientMod | Self::ServerMod => "mod",
             Self::Shader => "shader",
+            Self::ResourcePack => "resourcepack",
+            Self::DataPack => "datapack",
         }
     }
 
@@ -119,12 +130,16 @@ impl ContentPlacement {
                 client: SideRequirement::Required,
                 server: SideRequirement::Required,
             },
-            Self::ClientMod | Self::Shader => EnvSpec {
+            Self::ClientMod | Self::Shader | Self::ResourcePack => EnvSpec {
                 client: SideRequirement::Required,
                 server: SideRequirement::Unsupported,
             },
             Self::ServerMod => EnvSpec {
                 client: SideRequirement::Unsupported,
+                server: SideRequirement::Required,
+            },
+            Self::DataPack => EnvSpec {
+                client: SideRequirement::Required,
                 server: SideRequirement::Required,
             },
         }
@@ -158,6 +173,10 @@ struct PackDocument {
     server_mods: BTreeMap<String, String>,
     #[serde(default)]
     shaders: BTreeMap<String, String>,
+    #[serde(default)]
+    resource_packs: BTreeMap<String, String>,
+    #[serde(default)]
+    datapacks: BTreeMap<String, String>,
     #[serde(default, rename = "publish")]
     _publish: Option<toml::Value>,
 }
@@ -170,7 +189,9 @@ impl PackSpec {
             document.mods.len()
                 + document.client_mods.len()
                 + document.server_mods.len()
-                + document.shaders.len(),
+                + document.shaders.len()
+                + document.resource_packs.len()
+                + document.datapacks.len(),
         );
         append_content(&mut content, document.mods, ContentPlacement::SharedMod);
         append_content(
@@ -184,6 +205,12 @@ impl PackSpec {
             ContentPlacement::ServerMod,
         );
         append_content(&mut content, document.shaders, ContentPlacement::Shader);
+        append_content(
+            &mut content,
+            document.resource_packs,
+            ContentPlacement::ResourcePack,
+        );
+        append_content(&mut content, document.datapacks, ContentPlacement::DataPack);
         let spec = Self {
             format: document.format,
             pack: document.pack,
@@ -194,13 +221,10 @@ impl PackSpec {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format != 1 {
+        if self.format != PACK_MANIFEST_FORMAT {
             return Err(format!("unsupported pack.toml format {}", self.format).into());
         }
         validate_pack_meta(&self.pack)?;
-        if self.content.is_empty() {
-            return Err("pack.toml has no mods, client mods, server mods, or shaders".into());
-        }
         let mut ids = BTreeSet::new();
         for content in &self.content {
             check_content_id(&content.id)?;
@@ -297,6 +321,8 @@ pub struct Lockfile {
     pub pack: PackMeta,
     pub file: Vec<FileSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authored: Vec<AuthoredFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub curseforge: Vec<CurseForgeFile>,
 }
 
@@ -309,14 +335,46 @@ pub struct CurseForgeFile {
     pub file_id: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthoredRoot {
+    Shared,
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredFile {
+    pub root: AuthoredRoot,
+    pub path: String,
+    pub file_size: u64,
+    pub sha1: String,
+    pub sha512: String,
+}
+
+impl AuthoredFile {
+    pub fn validate(&self) -> Result<()> {
+        check_pack_path(&self.path)?;
+        check_digest(&self.sha1, 40, "sha1", &self.path)?;
+        check_digest(&self.sha512, 128, "sha512", &self.path)?;
+        Ok(())
+    }
+}
+
 impl Lockfile {
     pub fn new(pack: PackMeta, file: Vec<FileSpec>) -> Self {
         Self {
-            version: 2,
+            version: LOCKFILE_VERSION,
             pack,
             file,
+            authored: Vec::new(),
             curseforge: Vec::new(),
         }
+    }
+
+    pub fn set_authored(&mut self, authored: Vec<AuthoredFile>) {
+        self.authored = authored;
     }
 
     pub fn retain_curseforge_from(&mut self, previous: &Self) {
@@ -341,15 +399,14 @@ impl Lockfile {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != 2 {
+        if self.version != LOCKFILE_VERSION {
             return Err(format!("unsupported lock version {}", self.version).into());
         }
         validate_pack_meta(&self.pack)?;
-        if self.file.is_empty() {
-            return Err("pack.lock.toml has no [[file]] entries".into());
-        }
         let mut ids = BTreeSet::new();
         let mut paths = BTreeSet::new();
+        let mut client_paths = BTreeSet::new();
+        let mut server_paths = BTreeSet::new();
         for file in &self.file {
             file.validate()?;
             if !ids.insert(file.id.as_str()) {
@@ -357,6 +414,31 @@ impl Lockfile {
             }
             if !paths.insert(file.path.as_str()) {
                 return Err(format!("duplicate pack path {}", file.path).into());
+            }
+            if client_file(file) {
+                client_paths.insert(file.path.as_str());
+            }
+            if server_file(file) {
+                server_paths.insert(file.path.as_str());
+            }
+        }
+        let mut authored = BTreeSet::new();
+        for file in &self.authored {
+            file.validate()?;
+            if !authored.insert((file.root, file.path.as_str())) {
+                return Err(
+                    format!("duplicate authored file {:?}/{}", file.root, file.path).into(),
+                );
+            }
+            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Client)
+                && !client_paths.insert(file.path.as_str())
+            {
+                return Err(format!("duplicate client output path {}", file.path).into());
+            }
+            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Server)
+                && !server_paths.insert(file.path.as_str())
+            {
+                return Err(format!("duplicate server output path {}", file.path).into());
             }
         }
         let pins: BTreeSet<_> = self
@@ -397,9 +479,6 @@ pub fn check_pack_path(path: &str) -> Result<()> {
             .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(format!("invalid relative pack path `{path}`").into());
-    }
-    if path.split('/').next() == Some("world") {
-        return Err(format!("pack path `{path}` must not replace a server world").into());
     }
     Ok(())
 }
@@ -447,7 +526,6 @@ mod tests {
     #[test]
     fn rejects_unsafe_pack_paths_and_coordinates() {
         for path in [
-            "world/level.dat",
             "../mods/x.jar",
             "/mods/x.jar",
             "mods\\x.jar",
@@ -458,6 +536,7 @@ mod tests {
             assert!(check_pack_path(path).is_err(), "accepted {path}");
         }
         assert!(check_pack_path("mods/sodium.jar").is_ok());
+        assert!(check_pack_path("world/level.dat").is_ok());
         assert!(check_coordinate("pack.slug", "example-pack", false).is_ok());
         assert!(check_coordinate("pack.version", "1.2.0", true).is_ok());
         assert!(check_coordinate("pack.group", "org.example.packs", true).is_ok());
@@ -570,6 +649,20 @@ example = "1.2.3"
                 true,
                 false,
             ),
+            (
+                ContentPlacement::ResourcePack,
+                "resource_packs",
+                "resourcepacks",
+                true,
+                false,
+            ),
+            (
+                ContentPlacement::DataPack,
+                "datapacks",
+                "datapacks",
+                true,
+                true,
+            ),
         ];
         for (placement, table, folder, client, server) in cases {
             assert_eq!(placement.manifest_table(), table);
@@ -604,6 +697,12 @@ server = "1"
 
 [shaders]
 shader = "1"
+
+[resource_packs]
+resources = "1"
+
+[datapacks]
+data = "1"
 "#,
         )
         .expect("all placements");
@@ -615,6 +714,8 @@ shader = "1"
         assert_eq!(placements["client"], ContentPlacement::ClientMod);
         assert_eq!(placements["server"], ContentPlacement::ServerMod);
         assert_eq!(placements["shader"], ContentPlacement::Shader);
+        assert_eq!(placements["resources"], ContentPlacement::ResourcePack);
+        assert_eq!(placements["data"], ContentPlacement::DataPack);
     }
 
     #[test]
@@ -650,6 +751,73 @@ shader = "1"
     }
 
     #[test]
+    fn rejects_authored_output_collisions_per_built_side() {
+        let authored = |root, path: &str| AuthoredFile {
+            root,
+            path: path.into(),
+            file_size: 0,
+            sha1: "c".repeat(40),
+            sha512: "d".repeat(128),
+        };
+
+        let mut shared_and_client = valid_lock(Loader::Fabric);
+        shared_and_client.set_authored(vec![
+            authored(AuthoredRoot::Shared, "config/example.json"),
+            authored(AuthoredRoot::Client, "config/example.json"),
+        ]);
+        let error = shared_and_client
+            .to_toml()
+            .expect_err("shared and client collision")
+            .to_string();
+        assert!(error.contains("duplicate client output path config/example.json"));
+
+        let mut shared_and_server = valid_lock(Loader::Fabric);
+        shared_and_server.set_authored(vec![
+            authored(AuthoredRoot::Shared, "config/example.json"),
+            authored(AuthoredRoot::Server, "config/example.json"),
+        ]);
+        let error = shared_and_server
+            .to_toml()
+            .expect_err("shared and server collision")
+            .to_string();
+        assert!(error.contains("duplicate server output path config/example.json"));
+
+        let mut dependency_and_authored = valid_lock(Loader::Fabric);
+        dependency_and_authored
+            .set_authored(vec![authored(AuthoredRoot::Client, "mods/example.jar")]);
+        let error = dependency_and_authored
+            .to_toml()
+            .expect_err("dependency and authored collision")
+            .to_string();
+        assert!(error.contains("duplicate client output path mods/example.jar"));
+    }
+
+    #[test]
+    fn client_and_server_authored_roots_may_share_an_output_path() {
+        let mut lock = valid_lock(Loader::Fabric);
+        lock.set_authored(vec![
+            AuthoredFile {
+                root: AuthoredRoot::Client,
+                path: "config/example.json".into(),
+                file_size: 1,
+                sha1: "c".repeat(40),
+                sha512: "d".repeat(128),
+            },
+            AuthoredFile {
+                root: AuthoredRoot::Server,
+                path: "config/example.json".into(),
+                file_size: 1,
+                sha1: "e".repeat(40),
+                sha512: "f".repeat(128),
+            },
+        ]);
+
+        let encoded = lock.to_toml().expect("side-specific paths are disjoint");
+        let decoded = Lockfile::parse(&encoded).expect("round-trip lock");
+        assert_eq!(decoded.authored, lock.authored);
+    }
+
+    #[test]
     fn every_loader_round_trips_through_lock_toml() {
         for loader in [Loader::Fabric, Loader::Forge, Loader::NeoForge] {
             let lock = valid_lock(loader);
@@ -660,5 +828,18 @@ shader = "1"
                 loader
             );
         }
+    }
+
+    #[test]
+    fn lockfile_contract_is_version_one_only() {
+        let mut lock = valid_lock(Loader::Fabric);
+        assert!(
+            lock.to_toml()
+                .expect("version 1 lock")
+                .starts_with("version = 1")
+        );
+
+        lock.version = 2;
+        assert!(lock.to_toml().is_err());
     }
 }
