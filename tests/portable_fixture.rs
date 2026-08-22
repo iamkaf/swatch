@@ -40,6 +40,45 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
         String::from_utf8_lossy(&install.stderr)
     );
 
+    let stage = offline_command(binary, &root.path)
+        .args(["stage", "all"])
+        .output()
+        .expect("stage both sides");
+    assert!(
+        stage.status.success(),
+        "stage failed: {}",
+        String::from_utf8_lossy(&stage.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(stage.stdout).expect("UTF-8 stage output"),
+        format!(
+            "{}\n{}\n",
+            root.generated_dir().join("stage/client").display(),
+            root.generated_dir().join("stage/server").display()
+        )
+    );
+    assert!(
+        root.generated_dir()
+            .join("stage/client/mods/shared-fixture.jar")
+            .is_file()
+    );
+    assert!(
+        !root
+            .generated_dir()
+            .join("stage/client/mods/dedicated-fixture.jar")
+            .exists()
+    );
+    assert!(
+        root.generated_dir()
+            .join("stage/server/mods/shared-fixture.jar")
+            .is_file()
+    );
+    assert!(
+        root.generated_dir()
+            .join("stage/server/mods/dedicated-fixture.jar")
+            .is_file()
+    );
+
     let publish = offline_command(binary, &root.path)
         .args(["publish", "--dry-run"])
         .output()

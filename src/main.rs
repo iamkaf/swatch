@@ -76,6 +76,13 @@ fn run(args: Vec<String>) -> swatch::Result<()> {
             }
             Ok(())
         }
+        "stage" => {
+            let sides = parse_sides("stage", &args)?;
+            for side in sides {
+                println!("{}", swatch::stage(&root, side)?.display());
+            }
+            Ok(())
+        }
         "prepare" => {
             if !args.is_empty() {
                 return Err(format!("invalid prepare arguments; use `{TOOL_NAME} prepare`").into());
@@ -192,12 +199,16 @@ fn parse_add_args(
 }
 
 fn parse_build_sides(args: &[String]) -> swatch::Result<Vec<BuildSide>> {
+    parse_sides("build", args)
+}
+
+fn parse_sides(command: &str, args: &[String]) -> swatch::Result<Vec<BuildSide>> {
     match args {
         [side] if side == "client" => Ok(vec![BuildSide::Client]),
         [side] if side == "server" => Ok(vec![BuildSide::Server]),
         [side] if side == "all" => Ok(vec![BuildSide::Client, BuildSide::Server]),
         _ => Err(format!(
-            "invalid build arguments; use `{TOOL_NAME} build client`, `{TOOL_NAME} build server`, or `{TOOL_NAME} build all`"
+            "invalid {command} arguments; use `{TOOL_NAME} {command} client`, `{TOOL_NAME} {command} server`, or `{TOOL_NAME} {command} all`"
         )
         .into()),
     }
@@ -291,6 +302,9 @@ Minecraft pack authoring tool
   swatch build client        Build the client archive
   swatch build server        Build the dedicated server archive
   swatch build all           Build both archives
+  swatch stage client        Stage the client directory tree
+  swatch stage server        Stage the dedicated server directory tree
+  swatch stage all           Stage both directory trees
   swatch prepare             Prepare artifacts and write dist/release.json
   swatch verify              Verify every prepared artifact without credentials
   swatch publish --dry-run   Write dist/release.preview.json and show upload details
@@ -367,6 +381,16 @@ mod tests {
             [BuildSide::Client, BuildSide::Server]
         );
         assert!(parse_build_sides(&args(&["universal"])).is_err());
+        assert_eq!(
+            parse_sides("stage", &args(&["server"])).expect("server stage"),
+            [BuildSide::Server]
+        );
+        assert!(
+            parse_sides("stage", &args(&["universal"]))
+                .expect_err("invalid side")
+                .to_string()
+                .contains("swatch stage all")
+        );
     }
 
     #[test]

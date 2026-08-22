@@ -29,9 +29,9 @@ cd my-pack
 swatch install
 ```
 
-`init` writes `pack.toml`, a changelog, empty authored-content roots, a pack-owned `scripts/check` hook, and GitHub check and explicit release workflows. `--slug` defaults to the directory name and `--group` defaults to `org.example.packs`; set both before publishing a real pack.
+`init` writes `pack.toml`, a changelog, empty authored-content roots, pack-owned `scripts/check` and `scripts/check-runtime` hooks, and GitHub check and explicit release workflows. `--slug` defaults to the directory name and `--group` defaults to `org.example.packs`; set both before publishing a real pack.
 
-The generated `scripts/check` is deliberately a no-op. Put gameplay, configuration, and pack-policy checks there. Swatch only requires a zero exit status and does not interpret pack semantics.
+Both generated hooks are deliberately no-ops. Put fast gameplay, configuration, and content checks in `scripts/check`. Put expensive Minecraft launches in `scripts/check-runtime`. Generated CI runs the fast hook for pull requests and pushes, then runs the runtime hook on `main` and again before preparing a release. Swatch only requires zero exit statuses and does not interpret pack semantics.
 
 ## Pin content
 
@@ -99,6 +99,16 @@ swatch build all
 
 The client archive excludes server-only dependencies and authored files. The server archive excludes client-only dependencies and includes shared and server authored files. ZIP entries use a fixed timestamp and sorted paths, so the same inputs produce the same bytes.
 
+## Stage client and server trees
+
+```bash
+swatch stage client
+swatch stage server
+swatch stage all
+```
+
+Staging materializes ordinary Minecraft directory trees under `generated/stage/`. It verifies the locked cache without downloading, combines shared content with the requested side, preserves every locked path, and prunes files left by an older stage. Launchers and test tools can consume these directories without understanding Swatch's lockfile.
+
 ## Prepare and publish a release
 
 ```bash
@@ -115,13 +125,11 @@ When Maven publication is configured, strict preparation reads existing `maven-m
 
 An initialized pack declares GitHub as a destination without hard-coding an owner or repository. The generated workflow uses GitHub's `GITHUB_REPOSITORY` value. Set `publish.github.repository = "owner/repository"` when running a live GitHub publish elsewhere.
 
-Modrinth releases default to listed and featured. A pack that needs a quiet external release can own that policy in `pack.toml`:
+Swatch uploads versions to the configured Modrinth project. Listing and featured settings belong to the project owner in the Modrinth dashboard, so Swatch does not include them in `pack.toml` or upload requests.
 
 ```toml
 [publish.modrinth]
 project = "project-id"
-status = "unlisted"
-featured = false
 ```
 
 The existing preview remains available:
@@ -150,7 +158,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-The checked-in portable fixture runs without network access and covers NeoForge, exact pins, server-only content, the content-addressed cache, installation, side-specific archives, and publication preview.
+The checked-in portable fixture runs without network access and covers NeoForge, exact pins, server-only content, the content-addressed cache, installation, side-specific staging and archives, and publication preview.
 
 ## License
 

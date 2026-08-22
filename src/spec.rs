@@ -405,8 +405,8 @@ impl Lockfile {
         validate_pack_meta(&self.pack)?;
         let mut ids = BTreeSet::new();
         let mut paths = BTreeSet::new();
-        let mut client_paths = BTreeSet::new();
-        let mut server_paths = BTreeSet::new();
+        let mut client_paths = BTreeMap::new();
+        let mut server_paths = BTreeMap::new();
         for file in &self.file {
             file.validate()?;
             if !ids.insert(file.id.as_str()) {
@@ -416,10 +416,10 @@ impl Lockfile {
                 return Err(format!("duplicate pack path {}", file.path).into());
             }
             if client_file(file) {
-                client_paths.insert(file.path.as_str());
+                insert_output_path(&mut client_paths, &file.path, "client")?;
             }
             if server_file(file) {
-                server_paths.insert(file.path.as_str());
+                insert_output_path(&mut server_paths, &file.path, "server")?;
             }
         }
         let mut authored = BTreeSet::new();
@@ -430,15 +430,11 @@ impl Lockfile {
                     format!("duplicate authored file {:?}/{}", file.root, file.path).into(),
                 );
             }
-            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Client)
-                && !client_paths.insert(file.path.as_str())
-            {
-                return Err(format!("duplicate client output path {}", file.path).into());
+            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Client) {
+                insert_output_path(&mut client_paths, &file.path, "client")?;
             }
-            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Server)
-                && !server_paths.insert(file.path.as_str())
-            {
-                return Err(format!("duplicate server output path {}", file.path).into());
+            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Server) {
+                insert_output_path(&mut server_paths, &file.path, "server")?;
             }
         }
         let pins: BTreeSet<_> = self
@@ -473,14 +469,89 @@ pub fn check_pack_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
-        || path.contains('\0')
         || path
             .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
+            .any(|part| part.is_empty() || part == "." || part == ".." || !portable_part(part))
     {
         return Err(format!("invalid relative pack path `{path}`").into());
     }
+    if let Some(part) = path.split('/').find(|part| resembles_short_name(part)) {
+        return Err(format!(
+            "pack path `{path}` contains DOS 8.3-style component `{part}`; rename it without a `~<digits>` suffix"
+        )
+        .into());
+    }
     Ok(())
+}
+
+fn portable_part(part: &str) -> bool {
+    if part.ends_with(['.', ' '])
+        || part.chars().any(|character| {
+            character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
+    {
+        return false;
+    }
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        stem.as_str(),
+        "con" | "prn" | "aux" | "nul" | "conin$" | "conout$"
+    ) && !reserved_numbered_device(&stem, "com")
+        && !reserved_numbered_device(&stem, "lpt")
+}
+
+fn reserved_numbered_device(stem: &str, prefix: &str) -> bool {
+    stem.strip_prefix(prefix).is_some_and(|number| {
+        matches!(
+            number,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    })
+}
+
+fn resembles_short_name(part: &str) -> bool {
+    let stem = part.rsplit_once('.').map_or(part, |(stem, _)| stem);
+    stem.rsplit_once('~').is_some_and(|(_, suffix)| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn insert_output_path<'a>(
+    paths: &mut BTreeMap<String, &'a str>,
+    path: &'a str,
+    side: &str,
+) -> Result<()> {
+    let folded = path.to_lowercase();
+    if let Some(existing) = paths.get(&folded) {
+        if *existing == path {
+            return Err(format!("duplicate {side} output path {path}").into());
+        }
+        return Err(format!(
+            "case-insensitive {side} output path collision: {existing} and {path}"
+        )
+        .into());
+    }
+    if let Some(existing) = paths.iter().find_map(|(existing_folded, existing)| {
+        (output_path_is_ancestor(existing_folded, &folded)
+            || output_path_is_ancestor(&folded, existing_folded))
+        .then_some(existing)
+    }) {
+        return Err(
+            format!("{side} output file/directory path collision: {existing} and {path}").into(),
+        );
+    }
+    paths.insert(folded, path);
+    Ok(())
+}
+
+fn output_path_is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    descendant
+        .strip_prefix(ancestor)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 pub fn server_file(file: &FileSpec) -> bool {
@@ -532,17 +603,70 @@ mod tests {
             "mods//x.jar",
             "mods/./x.jar",
             "mods/x.jar/",
+            "mods/trailing. ",
+            "mods/trailing.",
+            "mods/CON",
+            "mods/nul.txt",
+            "mods/Com1.jar",
+            "mods/COM¹.jar",
+            "mods/lpt9/config.txt",
+            "config/a:b.txt",
+            "config/question?.txt",
+            "config/control\u{1f}.txt",
         ] {
             assert!(check_pack_path(path).is_err(), "accepted {path}");
         }
         assert!(check_pack_path("mods/sodium.jar").is_ok());
         assert!(check_pack_path("world/level.dat").is_ok());
+        assert!(check_pack_path("config/.gitkeep").is_ok());
+        assert!(check_pack_path("mods/com10.jar").is_ok());
         assert!(check_coordinate("pack.slug", "example-pack", false).is_ok());
         assert!(check_coordinate("pack.version", "1.2.0", true).is_ok());
         assert!(check_coordinate("pack.group", "org.example.packs", true).is_ok());
         assert!(check_coordinate("pack.slug", "../elsewhere", false).is_err());
         assert!(check_coordinate("pack.version", "../1.2.0", true).is_err());
         assert!(check_coordinate("pack.group", "com..modpacks", true).is_err());
+    }
+
+    #[test]
+    fn rejects_dos_short_name_aliases() {
+        for path in [
+            "mods/LONGFI~1.JAR",
+            "config/longfi~12/settings.json",
+            "resourcepacks/PACK~2.zip",
+        ] {
+            let error = check_pack_path(path)
+                .expect_err("DOS short-name alias")
+                .to_string();
+            assert!(error.contains("DOS 8.3-style component"));
+            assert!(error.contains("rename it without a `~<digits>` suffix"));
+        }
+        for path in [
+            "mods/long~name.jar",
+            "mods/long~.jar",
+            "mods/long~1beta.jar",
+        ] {
+            assert!(check_pack_path(path).is_ok(), "rejected {path}");
+        }
+    }
+
+    #[test]
+    fn rejects_console_device_paths() {
+        for path in [
+            "CONIN$",
+            "mods/conin$",
+            "config/ConOuT$.txt",
+            "logs/CONIN$.txt.old",
+        ] {
+            assert!(check_pack_path(path).is_err(), "accepted {path}");
+        }
+        for path in [
+            "mods/conin.txt",
+            "config/conout.json",
+            "logs/conin$extra.txt",
+        ] {
+            assert!(check_pack_path(path).is_ok(), "rejected {path}");
+        }
     }
 
     #[test]
@@ -790,6 +914,88 @@ data = "1"
             .expect_err("dependency and authored collision")
             .to_string();
         assert!(error.contains("duplicate client output path mods/example.jar"));
+
+        let mut case_alias = valid_lock(Loader::Fabric);
+        case_alias.file[0].path = "mods/Example.jar".into();
+        case_alias.set_authored(vec![authored(AuthoredRoot::Client, "mods/example.jar")]);
+        let error = case_alias
+            .to_toml()
+            .expect_err("case-insensitive dependency and authored collision")
+            .to_string();
+        assert!(error.contains("case-insensitive client output path collision"));
+        assert!(error.contains("mods/Example.jar"));
+        assert!(error.contains("mods/example.jar"));
+    }
+
+    #[test]
+    fn rejects_case_insensitive_dependency_collisions_per_side() {
+        let mut lock = valid_lock(Loader::Fabric);
+        lock.file[0].path = "mods/Example.jar".into();
+        let mut alias = lock.file[0].clone();
+        alias.id = "alias".into();
+        alias.path = "mods/example.jar".into();
+        lock.file.push(alias);
+
+        let error = lock
+            .to_toml()
+            .expect_err("case-insensitive client collision")
+            .to_string();
+        assert!(error.contains("case-insensitive client output path collision"));
+
+        lock.file[0].env = ContentPlacement::ClientMod.env();
+        lock.file[1].env = ContentPlacement::ServerMod.env();
+        lock.to_toml()
+            .expect("case aliases on disjoint sides do not collide");
+    }
+
+    #[test]
+    fn rejects_file_directory_output_collisions_per_built_side() {
+        let authored = |path: &str| AuthoredFile {
+            root: AuthoredRoot::Client,
+            path: path.into(),
+            file_size: 0,
+            sha1: "c".repeat(40),
+            sha512: "d".repeat(128),
+        };
+
+        let mut dependency_is_ancestor = valid_lock(Loader::Fabric);
+        dependency_is_ancestor.file[0].path = "config/Options".into();
+        dependency_is_ancestor.set_authored(vec![authored("config/options/settings.json")]);
+        let error = dependency_is_ancestor
+            .to_toml()
+            .expect_err("dependency file blocks authored descendant")
+            .to_string();
+        assert!(error.contains("client output file/directory path collision"));
+        assert!(error.contains("config/Options"));
+        assert!(error.contains("config/options/settings.json"));
+
+        let mut authored_is_ancestor = valid_lock(Loader::Fabric);
+        authored_is_ancestor.file[0].path = "config/Options/settings.json".into();
+        authored_is_ancestor.set_authored(vec![authored("config/options")]);
+        let error = authored_is_ancestor
+            .to_toml()
+            .expect_err("authored file blocks dependency descendant")
+            .to_string();
+        assert!(error.contains("client output file/directory path collision"));
+        assert!(error.contains("config/Options/settings.json"));
+        assert!(error.contains("config/options"));
+    }
+
+    #[test]
+    fn mutually_exclusive_sides_may_use_related_output_paths() {
+        let mut lock = valid_lock(Loader::Fabric);
+        lock.file[0].env = ContentPlacement::ClientMod.env();
+        lock.file[0].path = "config/Options".into();
+        lock.set_authored(vec![AuthoredFile {
+            root: AuthoredRoot::Server,
+            path: "config/options/settings.json".into(),
+            file_size: 0,
+            sha1: "c".repeat(40),
+            sha512: "d".repeat(128),
+        }]);
+
+        lock.to_toml()
+            .expect("related paths on disjoint sides do not collide");
     }
 
     #[test]

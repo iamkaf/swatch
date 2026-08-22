@@ -13,6 +13,7 @@ pub mod init;
 pub mod publish;
 mod resolve;
 pub mod spec;
+mod stage;
 
 pub use export::BuildSide;
 
@@ -185,6 +186,15 @@ pub fn build(root: &PackRoot, side: BuildSide) -> Result<PathBuf> {
         return Err("pack.toml changed since the last install; run `swatch install` first".into());
     }
     export::export_from_lock(root, &lock, side)
+}
+
+pub fn stage(root: &PackRoot, side: BuildSide) -> Result<PathBuf> {
+    let spec = load_spec(root)?;
+    let lock = load_lock(root)?;
+    if !resolve::lock_matches_spec(&spec, &lock) {
+        return Err("pack.toml changed since the last install; run `swatch install` first".into());
+    }
+    stage::stage_from_lock(root, &lock, side)
 }
 
 #[cfg(test)]

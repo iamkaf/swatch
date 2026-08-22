@@ -16,8 +16,6 @@ struct VersionData<'a> {
     version_type: &'a str,
     loaders: &'a [String],
     game_versions: &'a [String],
-    featured: bool,
-    status: &'a str,
     project_id: &'a str,
     file_parts: Vec<String>,
     primary_file: String,
@@ -85,8 +83,6 @@ pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
         version_type: "release",
         loaders: &loaders,
         game_versions: &game_versions,
-        featured: config.featured(),
-        status: config.status.as_str(),
         project_id: &config.project,
         file_parts: vec!["file".into()],
         primary_file: "file".into(),
@@ -166,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn includes_the_required_empty_dependency_list() {
+    fn serializes_the_swatch_owned_version_data() {
         let data = VersionData {
             name: "Example Pack 1.0.0",
             version_number: "1.0.0",
@@ -175,13 +171,25 @@ mod tests {
             version_type: "release",
             loaders: &["fabric".into()],
             game_versions: &["26.2".into()],
-            featured: false,
-            status: "listed",
             project_id: "example",
             file_parts: vec!["file".into()],
             primary_file: "file".into(),
         };
         let json = serde_json::to_value(data).expect("version JSON");
-        assert_eq!(json["dependencies"], serde_json::json!([]));
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "Example Pack 1.0.0",
+                "version_number": "1.0.0",
+                "changelog": "Notes",
+                "dependencies": [],
+                "version_type": "release",
+                "loaders": ["fabric"],
+                "game_versions": ["26.2"],
+                "project_id": "example",
+                "file_parts": ["file"],
+                "primary_file": "file"
+            })
+        );
     }
 }

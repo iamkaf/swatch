@@ -53,7 +53,7 @@ impl BuildSide {
         }
     }
 
-    fn accepts(self, file: &FileSpec) -> bool {
+    pub(crate) fn accepts(self, file: &FileSpec) -> bool {
         match self {
             Self::Client => client_file(file),
             Self::Server => server_file(file),

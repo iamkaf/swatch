@@ -10,6 +10,7 @@ pub fn cached_file(root: &PackRoot, file: &FileSpec) -> PathBuf {
     root.cache_dir().join("objects").join(&file.sha512)
 }
 
+#[derive(Debug)]
 pub struct VerifiedFiles {
     paths: BTreeMap<String, PathBuf>,
 }
@@ -21,6 +22,30 @@ impl VerifiedFiles {
             .map(PathBuf::as_path)
             .ok_or_else(|| format!("{} was not verified", file.path).into())
     }
+}
+
+pub(crate) fn verify_cached(root: &PackRoot, files: &[&FileSpec]) -> Result<VerifiedFiles> {
+    let mut paths = BTreeMap::new();
+    for file in files {
+        file.validate()?;
+        let path = cached_file(root, file);
+        let bytes = fs::read(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::Error::from(format!(
+                    "missing cached object for {}; run `swatch install` first",
+                    file.path
+                ))
+            } else {
+                crate::Error::from(format!(
+                    "could not read cached object for {}: {error}",
+                    file.path
+                ))
+            }
+        })?;
+        verify_bytes(file, &bytes)?;
+        paths.insert(file.path.clone(), path);
+    }
+    Ok(VerifiedFiles { paths })
 }
 
 pub fn ensure_all(root: &PackRoot, files: &[FileSpec]) -> Result<VerifiedFiles> {
@@ -93,7 +118,7 @@ fn http_client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-fn verify_bytes(file: &FileSpec, bytes: &[u8]) -> Result<()> {
+pub(crate) fn verify_bytes(file: &FileSpec, bytes: &[u8]) -> Result<()> {
     if bytes.len() as u64 != file.file_size {
         return Err(format!(
             "{} size {} did not match pin {}",
@@ -175,5 +200,21 @@ mod tests {
         fs::create_dir_all(object.parent().expect("object directory")).expect("object directory");
         fs::write(object, b"corrupt").expect("cached object");
         assert!(ensure_all(&root, &[file]).is_err());
+    }
+
+    #[test]
+    fn cached_verification_never_downloads_missing_objects() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+
+        let file = file("mods/example.jar");
+        let error = verify_cached(&root, &[&file])
+            .expect_err("missing cached object")
+            .to_string();
+
+        assert!(error.contains("missing cached object"));
+        assert!(error.contains("run `swatch install` first"));
     }
 }

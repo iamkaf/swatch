@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version already recorded in Cargo.toml, such as 0.2.0
+        description: Version already recorded in Cargo.toml, such as 0.3.0
         required: true
         type: string
 
