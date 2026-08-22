@@ -121,6 +121,7 @@ struct PreparedRelease {
 pub struct ReleaseManifest {
     pub schema_version: u32,
     pub pack_version: String,
+    pub preparation_mode: ReleasePreparation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
     pub artifacts: Vec<ReleaseArtifact>,
@@ -137,8 +138,9 @@ pub struct ReleaseArtifact {
     pub destinations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreparationMode {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleasePreparation {
     Strict,
     Preview,
 }
@@ -159,7 +161,7 @@ impl PreparedRelease {
 }
 
 /// Resolve every local release artifact once.
-fn prepare(root: &PackRoot, mode: PreparationMode) -> Result<PreparedRelease> {
+fn prepare(root: &PackRoot, mode: ReleasePreparation) -> Result<PreparedRelease> {
     let lock = crate::load_lock(root)?;
     let manifest = fs::read_to_string(root.pack_toml())?;
     let spec = crate::spec::PackSpec::parse(&manifest)?;
@@ -178,7 +180,7 @@ fn prepare(root: &PackRoot, mode: PreparationMode) -> Result<PreparedRelease> {
     let changelog = if wants_changelog {
         match load_changelog(root, &config) {
             Ok(changelog) => Some(changelog),
-            Err(_) if mode == PreparationMode::Preview => None,
+            Err(_) if mode == ReleasePreparation::Preview => None,
             Err(error) => return Err(error),
         }
     } else {
@@ -240,8 +242,8 @@ fn prepare(root: &PackRoot, mode: PreparationMode) -> Result<PreparedRelease> {
 }
 
 pub fn prepare_release(root: &PackRoot) -> Result<PathBuf> {
-    let release = prepare(root, PreparationMode::Strict)?;
-    let manifest = manifest_from_release(root, &release)?;
+    let release = prepare(root, ReleasePreparation::Strict)?;
+    let manifest = manifest_from_release(root, &release, ReleasePreparation::Strict)?;
     let path = root.dist_dir().join("release.json");
     let mut bytes = serde_json::to_vec_pretty(&manifest)?;
     bytes.push(b'\n');
@@ -257,8 +259,8 @@ pub fn verify_release(root: &PackRoot) -> Result<ReleaseManifest> {
 /// Prepare once, then publish the same artifact bytes to every configured target.
 pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
     let release = if mode == PublishMode::DryRun {
-        let release = prepare(root, PreparationMode::Preview)?;
-        let manifest = manifest_from_release(root, &release)?;
+        let release = prepare(root, ReleasePreparation::Preview)?;
+        let manifest = manifest_from_release(root, &release, ReleasePreparation::Preview)?;
         let path = root.dist_dir().join("release.json");
         let mut bytes = serde_json::to_vec_pretty(&manifest)?;
         bytes.push(b'\n');
@@ -324,7 +326,11 @@ fn load_changelog(root: &PackRoot, config: &PublishConfig) -> Result<String> {
     })
 }
 
-fn manifest_from_release(root: &PackRoot, release: &PreparedRelease) -> Result<ReleaseManifest> {
+fn manifest_from_release(
+    root: &PackRoot,
+    release: &PreparedRelease,
+    preparation: ReleasePreparation,
+) -> Result<ReleaseManifest> {
     let mut artifacts = Vec::with_capacity(release.artifacts.len());
     for artifact in &release.artifacts {
         artifacts.push(ReleaseArtifact {
@@ -340,6 +346,7 @@ fn manifest_from_release(root: &PackRoot, release: &PreparedRelease) -> Result<R
     Ok(ReleaseManifest {
         schema_version: 1,
         pack_version: release.lock.pack.version.clone(),
+        preparation_mode: preparation,
         source_revision: source_revision(root),
         artifacts,
     })
@@ -371,6 +378,12 @@ fn load_prepared(root: &PackRoot) -> Result<(ReleaseManifest, PreparedRelease)> 
             manifest.schema_version
         )
         .into());
+    }
+    if manifest.preparation_mode != ReleasePreparation::Strict {
+        return Err(
+            "release.json is a preview and cannot be verified or published; run `swatch prepare`"
+                .into(),
+        );
     }
     if manifest.pack_version != lock.pack.version {
         return Err(format!(
@@ -659,7 +672,7 @@ struct ExistingVersions {
 fn prepare_maven_metadata(
     lock: &Lockfile,
     repository: &str,
-    mode: PreparationMode,
+    mode: ReleasePreparation,
 ) -> Result<String> {
     let group_path = lock.pack.group.replace('.', "/");
     let url = format!(
@@ -669,7 +682,7 @@ fn prepare_maven_metadata(
         lock.pack.slug
     );
     let mut versions = BTreeSet::new();
-    if mode == PreparationMode::Strict {
+    if mode == ReleasePreparation::Strict {
         let response = http_client()?.get(&url).send()?;
         if response.status().is_success() {
             let existing: ExistingMetadata =
@@ -839,7 +852,7 @@ repository = "example/example-pack"
     #[test]
     fn preparation_retains_one_lock_and_changelog_snapshot() {
         let (_directory, root, lock) = release_root();
-        let release = prepare(&root, PreparationMode::Strict).expect("prepared release");
+        let release = prepare(&root, ReleasePreparation::Strict).expect("prepared release");
 
         let mut replacement = lock;
         replacement.pack.version = "2.0.0".into();
@@ -871,8 +884,53 @@ repository = "example/example-pack"
     fn dry_run_does_not_require_release_notes() {
         let (_directory, root, _lock) = release_root();
         fs::remove_file(root.path.join("CHANGELOG.md")).expect("remove changelog");
-        let release = prepare(&root, PreparationMode::Preview).expect("dry-run release");
+        let release = prepare(&root, ReleasePreparation::Preview).expect("dry-run release");
         assert!(release.changelog.is_none());
+    }
+
+    #[test]
+    fn maven_preview_cannot_be_verified_or_published() {
+        let (_directory, root, _lock) = release_root();
+        let manifest = fs::read_to_string(root.pack_toml())
+            .expect("read manifest")
+            .replace(
+                "[publish.github]\nrepository = \"example/example-pack\"",
+                "[publish.maven]\nrepository = \"https://example.invalid/maven\"",
+            );
+        fs::write(root.pack_toml(), manifest).expect("write Maven publish target");
+        fs::create_dir_all(root.dist_dir()).expect("create dist directory");
+        let metadata_path = root.dist_dir().join("maven-metadata.xml");
+        fs::write(
+            &metadata_path,
+            metadata_xml(
+                "org.example.packs",
+                "example-pack",
+                "0.9.0",
+                &["0.9.0".into()],
+            ),
+        )
+        .expect("write prior Maven metadata");
+
+        publish(&root, PublishMode::DryRun).expect("Maven preview");
+        let preview: ReleaseManifest = serde_json::from_slice(
+            &fs::read(root.dist_dir().join("release.json")).expect("preview manifest"),
+        )
+        .expect("parse preview manifest");
+        assert_eq!(preview.preparation_mode, ReleasePreparation::Preview);
+        assert!(
+            !fs::read_to_string(metadata_path)
+                .expect("preview metadata")
+                .contains("0.9.0")
+        );
+
+        let verify_error = verify_release(&root)
+            .expect_err("preview verification")
+            .to_string();
+        assert!(verify_error.contains("preview"));
+        let publish_error = publish(&root, PublishMode::Publish)
+            .expect_err("preview publication")
+            .to_string();
+        assert!(publish_error.contains("preview"));
     }
 
     #[test]
@@ -884,6 +942,7 @@ repository = "example/example-pack"
                 .expect("parse release JSON");
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.pack_version, "1.0.0");
+        assert_eq!(manifest.preparation_mode, ReleasePreparation::Strict);
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.role == "client"
                 && artifact.destinations == ["github"]

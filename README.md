@@ -107,7 +107,7 @@ swatch verify
 swatch publish
 ```
 
-`prepare` writes client and server archives plus `dist/release.json`. The JSON contract includes schema version 1, pack version, source revision when Git can provide one, artifact paths, media types, SHA-256 and SHA-512 hashes, and configured destinations. Preparation and verification do not read publication credentials.
+`prepare` writes client and server archives plus `dist/release.json`. The JSON contract includes schema version 1, a strict or preview preparation mode, pack version, source revision when Git can provide one, artifact paths, media types, SHA-256 and SHA-512 hashes, and configured destinations. Preparation and verification do not read publication credentials.
 
 When Maven publication is configured, strict preparation reads existing `maven-metadata.xml` without authentication and includes the merged bytes in `release.json`. This keeps later Maven releases exact and prepare-once. A private repository whose metadata cannot be read anonymously cannot use this release path yet.
 
@@ -121,7 +121,7 @@ The existing preview remains available:
 swatch publish --dry-run
 ```
 
-It prepares a local preview and prints configured upload targets without using credentials. A live publish reads platform credentials only after `swatch prepare` has succeeded.
+It writes a preview snapshot and prints configured upload targets without using credentials. Preview snapshots cannot be verified or published. Run `swatch prepare` afterward to create the strict snapshot used by a live publish. A live publish reads platform credentials only after strict preparation has succeeded.
 
 ## CurseForge mappings
 

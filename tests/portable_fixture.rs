@@ -105,6 +105,7 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
     .expect("parse release manifest");
     assert_eq!(release["schemaVersion"], 1);
     assert_eq!(release["packVersion"], "0.1.0");
+    assert_eq!(release["preparationMode"], "preview");
     assert!(
         release["artifacts"]
             .as_array()
