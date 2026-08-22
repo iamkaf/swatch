@@ -85,10 +85,8 @@ fn find_or_create_release(
     repository: &str,
     prepared: &PreparedRelease,
 ) -> Result<Release> {
-    let url = format!(
-        "{API_BASE}/repos/{}/releases/tags/{}",
-        repository, prepared.lock.pack.version
-    );
+    let tag = release_tag(&prepared.lock.pack.version);
+    let url = format!("{API_BASE}/repos/{}/releases/tags/{}", repository, tag);
     let response = client.get(&url).bearer_auth(token).send()?;
     if response.status() != reqwest::StatusCode::NOT_FOUND {
         return Ok(response.error_for_status()?.json()?);
@@ -98,7 +96,7 @@ fn find_or_create_release(
         .post(format!("{API_BASE}/repos/{repository}/releases"))
         .bearer_auth(token)
         .json(&NewRelease {
-            tag_name: &prepared.lock.pack.version,
+            tag_name: &tag,
             name: &format!("{} {}", prepared.lock.pack.name, prepared.lock.pack.version),
             body,
             draft: false,
@@ -106,6 +104,10 @@ fn find_or_create_release(
         })
         .send()?;
     Ok(response.error_for_status()?.json()?)
+}
+
+fn release_tag(version: &str) -> String {
+    format!("v{version}")
 }
 
 fn upload_if_needed(
@@ -211,4 +213,14 @@ fn urlencoding(value: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_tags_are_version_prefixed() {
+        assert_eq!(release_tag("1.2.0"), "v1.2.0");
+    }
 }

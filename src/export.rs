@@ -339,9 +339,16 @@ mod tests {
             );
         }
 
-        let server = export_from_lock(&root, &lock, BuildSide::Server).expect("server archive");
+        let first = export_from_lock(&root, &lock, BuildSide::Server).expect("first server");
+        let first_bytes = fs::read(&first).expect("first server bytes");
+        fs::remove_file(&first).expect("remove first server archive");
+        fs::write(root.server_overrides_dir().join("server.txt"), b"server\n")
+            .expect("rewrite server file");
+        let second = export_from_lock(&root, &lock, BuildSide::Server).expect("second server");
+        assert_eq!(first_bytes, fs::read(second).expect("second server bytes"));
+
         let mut server =
-            zip::ZipArchive::new(File::open(server).expect("server file")).expect("server zip");
+            zip::ZipArchive::new(std::io::Cursor::new(first_bytes)).expect("server zip");
         let server_names: Vec<_> = (0..server.len())
             .map(|index| server.by_index(index).expect("entry").name().to_string())
             .collect();

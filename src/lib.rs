@@ -150,9 +150,32 @@ pub fn load_spec(root: &PackRoot) -> Result<spec::PackSpec> {
 
 pub fn load_lock(root: &PackRoot) -> Result<spec::Lockfile> {
     let path = root.lock_toml();
-    let text = std::fs::read_to_string(&path)
-        .map_err(|_| format!("missing {}; run `swatch install` first", path.display()))?;
-    spec::Lockfile::parse(&text)
+    load_lock_if_present(root)?
+        .ok_or_else(|| format!("missing {}; run `swatch install` first", path.display()).into())
+}
+
+pub(crate) fn load_lock_if_present(root: &PackRoot) -> Result<Option<spec::Lockfile>> {
+    let path = root.lock_toml();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => return Err(format!("could not read {}: {error}", path.display()).into()),
+                Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(metadata_error) => {
+                    return Err(format!(
+                        "could not inspect {} after a read error: {metadata_error}",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        Err(error) => return Err(format!("could not read {}: {error}", path.display()).into()),
+    };
+    spec::Lockfile::parse(&text).map(Some)
 }
 
 pub fn build(root: &PackRoot, side: BuildSide) -> Result<PathBuf> {
@@ -162,4 +185,58 @@ pub fn build(root: &PackRoot, side: BuildSide) -> Result<PathBuf> {
         return Err("pack.toml changed since the last install; run `swatch install` first".into());
     }
     export::export_from_lock(root, &lock, side)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_lock_reports_an_absent_file_as_missing() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+
+        let error = load_lock(&root).expect_err("missing lockfile").to_string();
+
+        assert!(error.contains("missing"));
+        assert!(error.contains("run `swatch install` first"));
+    }
+
+    #[test]
+    fn load_lock_does_not_report_other_read_errors_as_missing() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        std::fs::create_dir(root.lock_toml()).expect("lockfile directory");
+
+        let error = load_lock(&root)
+            .expect_err("unreadable lockfile")
+            .to_string();
+
+        assert!(error.contains("could not read"));
+        assert!(!error.contains("missing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_lock_does_not_treat_a_dangling_symlink_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        symlink("missing-target", root.lock_toml()).expect("dangling lockfile symlink");
+
+        let error = load_lock(&root)
+            .expect_err("unreadable lockfile symlink")
+            .to_string();
+
+        assert!(error.contains("could not read"));
+        assert!(!error.contains("missing"));
+        assert!(root.lock_toml().is_symlink());
+    }
 }

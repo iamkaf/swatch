@@ -405,6 +405,8 @@ impl Lockfile {
         validate_pack_meta(&self.pack)?;
         let mut ids = BTreeSet::new();
         let mut paths = BTreeSet::new();
+        let mut client_paths = BTreeSet::new();
+        let mut server_paths = BTreeSet::new();
         for file in &self.file {
             file.validate()?;
             if !ids.insert(file.id.as_str()) {
@@ -412,6 +414,12 @@ impl Lockfile {
             }
             if !paths.insert(file.path.as_str()) {
                 return Err(format!("duplicate pack path {}", file.path).into());
+            }
+            if client_file(file) {
+                client_paths.insert(file.path.as_str());
+            }
+            if server_file(file) {
+                server_paths.insert(file.path.as_str());
             }
         }
         let mut authored = BTreeSet::new();
@@ -421,6 +429,16 @@ impl Lockfile {
                 return Err(
                     format!("duplicate authored file {:?}/{}", file.root, file.path).into(),
                 );
+            }
+            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Client)
+                && !client_paths.insert(file.path.as_str())
+            {
+                return Err(format!("duplicate client output path {}", file.path).into());
+            }
+            if matches!(file.root, AuthoredRoot::Shared | AuthoredRoot::Server)
+                && !server_paths.insert(file.path.as_str())
+            {
+                return Err(format!("duplicate server output path {}", file.path).into());
             }
         }
         let pins: BTreeSet<_> = self
@@ -461,9 +479,6 @@ pub fn check_pack_path(path: &str) -> Result<()> {
             .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(format!("invalid relative pack path `{path}`").into());
-    }
-    if path.split('/').next() == Some("world") {
-        return Err(format!("pack path `{path}` must not replace a server world").into());
     }
     Ok(())
 }
@@ -511,7 +526,6 @@ mod tests {
     #[test]
     fn rejects_unsafe_pack_paths_and_coordinates() {
         for path in [
-            "world/level.dat",
             "../mods/x.jar",
             "/mods/x.jar",
             "mods\\x.jar",
@@ -522,6 +536,7 @@ mod tests {
             assert!(check_pack_path(path).is_err(), "accepted {path}");
         }
         assert!(check_pack_path("mods/sodium.jar").is_ok());
+        assert!(check_pack_path("world/level.dat").is_ok());
         assert!(check_coordinate("pack.slug", "example-pack", false).is_ok());
         assert!(check_coordinate("pack.version", "1.2.0", true).is_ok());
         assert!(check_coordinate("pack.group", "org.example.packs", true).is_ok());
@@ -733,6 +748,73 @@ data = "1"
         lock.file[0].path = "../outside.jar".into();
         let encode_error = lock.to_toml().expect_err("unsafe path").to_string();
         assert!(encode_error.contains("invalid relative pack path"));
+    }
+
+    #[test]
+    fn rejects_authored_output_collisions_per_built_side() {
+        let authored = |root, path: &str| AuthoredFile {
+            root,
+            path: path.into(),
+            file_size: 0,
+            sha1: "c".repeat(40),
+            sha512: "d".repeat(128),
+        };
+
+        let mut shared_and_client = valid_lock(Loader::Fabric);
+        shared_and_client.set_authored(vec![
+            authored(AuthoredRoot::Shared, "config/example.json"),
+            authored(AuthoredRoot::Client, "config/example.json"),
+        ]);
+        let error = shared_and_client
+            .to_toml()
+            .expect_err("shared and client collision")
+            .to_string();
+        assert!(error.contains("duplicate client output path config/example.json"));
+
+        let mut shared_and_server = valid_lock(Loader::Fabric);
+        shared_and_server.set_authored(vec![
+            authored(AuthoredRoot::Shared, "config/example.json"),
+            authored(AuthoredRoot::Server, "config/example.json"),
+        ]);
+        let error = shared_and_server
+            .to_toml()
+            .expect_err("shared and server collision")
+            .to_string();
+        assert!(error.contains("duplicate server output path config/example.json"));
+
+        let mut dependency_and_authored = valid_lock(Loader::Fabric);
+        dependency_and_authored
+            .set_authored(vec![authored(AuthoredRoot::Client, "mods/example.jar")]);
+        let error = dependency_and_authored
+            .to_toml()
+            .expect_err("dependency and authored collision")
+            .to_string();
+        assert!(error.contains("duplicate client output path mods/example.jar"));
+    }
+
+    #[test]
+    fn client_and_server_authored_roots_may_share_an_output_path() {
+        let mut lock = valid_lock(Loader::Fabric);
+        lock.set_authored(vec![
+            AuthoredFile {
+                root: AuthoredRoot::Client,
+                path: "config/example.json".into(),
+                file_size: 1,
+                sha1: "c".repeat(40),
+                sha512: "d".repeat(128),
+            },
+            AuthoredFile {
+                root: AuthoredRoot::Server,
+                path: "config/example.json".into(),
+                file_size: 1,
+                sha1: "e".repeat(40),
+                sha512: "f".repeat(128),
+            },
+        ]);
+
+        let encoded = lock.to_toml().expect("side-specific paths are disjoint");
+        let decoded = Lockfile::parse(&encoded).expect("round-trip lock");
+        assert_eq!(decoded.authored, lock.authored);
     }
 
     #[test]

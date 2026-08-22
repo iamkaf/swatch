@@ -1,5 +1,5 @@
 use crate::spec::{ContentPlacement, Lockfile};
-use crate::{PackRoot, Result, curseforge, fetch, load_lock, load_spec, resolve};
+use crate::{PackRoot, Result, curseforge, fetch, load_lock_if_present, load_spec, resolve};
 use std::fs;
 use std::io::Write;
 use std::str::FromStr;
@@ -64,7 +64,12 @@ pub struct InstallOptions {
 
 pub fn install(root: &PackRoot, options: InstallOptions) -> Result<InstallReport> {
     let spec = load_spec(root)?;
-    let previous = load_lock(root).ok();
+    let previous = load_lock_if_present(root)?;
+    let write = if previous.is_some() {
+        LockWrite::Replace
+    } else {
+        LockWrite::Create
+    };
     let mut lock = match previous.as_ref() {
         Some(lock) if resolve::lock_matches_spec(&spec, lock) => lock.clone(),
         previous => resolve::resolve_candidate(&spec, previous)?,
@@ -74,7 +79,7 @@ pub fn install(root: &PackRoot, options: InstallOptions) -> Result<InstallReport
     if options.curseforge {
         lock = curseforge::ensure_mappings(root, lock, &verified)?;
     }
-    write_lock(root, &lock)?;
+    write_lock(root, &lock, write)?;
     Ok(InstallReport {
         files: lock.file.len(),
     })
@@ -106,7 +111,13 @@ fn append_modrinth(
     Ok(())
 }
 
-fn write_lock(root: &PackRoot, lock: &Lockfile) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockWrite {
+    Create,
+    Replace,
+}
+
+fn write_lock(root: &PackRoot, lock: &Lockfile, write: LockWrite) -> Result<()> {
     let text = lock.to_toml()?;
     let parent = root
         .lock_toml()
@@ -115,9 +126,11 @@ fn write_lock(root: &PackRoot, lock: &Lockfile) -> Result<()> {
         .to_path_buf();
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(text.as_bytes())?;
-    temporary
-        .persist(root.lock_toml())
-        .map_err(|error| crate::Error::from_display(error.error))?;
+    match write {
+        LockWrite::Create => temporary.persist_noclobber(root.lock_toml()),
+        LockWrite::Replace => temporary.persist(root.lock_toml()),
+    }
+    .map_err(|error| crate::Error::from_display(error.error))?;
     Ok(())
 }
 
@@ -276,13 +289,13 @@ curseforge = false
         fs::write(root.lock_toml(), "old lock\n").expect("old lock");
 
         let valid = lock();
-        write_lock(&root, &valid).expect("commit valid lock");
+        write_lock(&root, &valid, LockWrite::Replace).expect("commit valid lock");
         let committed = fs::read_to_string(root.lock_toml()).expect("committed lock");
         assert_eq!(Lockfile::parse(&committed).expect("valid lock"), valid);
 
         let mut invalid = valid;
         invalid.file[0].path = "../outside.jar".into();
-        assert!(write_lock(&root, &invalid).is_err());
+        assert!(write_lock(&root, &invalid, LockWrite::Replace).is_err());
         assert_eq!(
             fs::read_to_string(root.lock_toml()).expect("retained lock"),
             committed
@@ -325,5 +338,68 @@ loader_version = "0.19.3"
             .expect_err("authored drift")
             .to_string();
         assert!(error.contains("authored files differ"));
+    }
+
+    #[test]
+    fn lock_creation_does_not_replace_a_file_that_appeared() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        fs::write(root.lock_toml(), "appeared while installing\n").expect("concurrent lock");
+
+        write_lock(&root, &lock(), LockWrite::Create).expect_err("refuse replacement");
+
+        assert_eq!(
+            fs::read_to_string(root.lock_toml()).expect("preserved lock"),
+            "appeared while installing\n"
+        );
+    }
+
+    #[test]
+    fn install_preserves_every_invalid_existing_lock() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        fs::write(
+            root.pack_toml(),
+            r#"format = 1
+
+[pack]
+name = "Example"
+slug = "example"
+version = "1.0.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "fabric"
+loader_version = "0.19.3"
+"#,
+        )
+        .expect("manifest");
+
+        let valid = lock().to_toml().expect("valid lock text");
+        let unsupported = valid.replacen("version = 1", "version = 2", 1).into_bytes();
+        let corrupt = valid
+            .replacen(
+                &format!("sha1 = \"{}\"", "a".repeat(40)),
+                "sha1 = \"bad\"",
+                1,
+            )
+            .into_bytes();
+        let invalid_locks = [
+            b"version = [\n".to_vec(),
+            unsupported,
+            corrupt,
+            vec![0xff, 0xfe],
+        ];
+
+        for invalid in invalid_locks {
+            fs::write(root.lock_toml(), &invalid).expect("invalid lock");
+
+            install(&root, InstallOptions::default()).expect_err("reject invalid lock");
+
+            assert_eq!(fs::read(root.lock_toml()).expect("preserved lock"), invalid);
+        }
     }
 }

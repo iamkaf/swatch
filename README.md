@@ -109,11 +109,20 @@ swatch publish
 
 `prepare` writes client and server archives plus `dist/release.json`. The JSON contract includes schema version 1, a strict or preview preparation mode, pack version, source revision when Git can provide one, artifact paths, media types, SHA-256 and SHA-512 hashes, and configured destinations. Preparation and verification do not read publication credentials.
 
-When Maven publication is configured, strict preparation reads existing `maven-metadata.xml` without authentication and includes the merged bytes in `release.json`. A private repository whose metadata cannot be read anonymously cannot use this preparation path. Swatch does not upload Maven releases yet. Generic HTTPS Maven repositories do not provide a transaction that can commit versioned artifacts and mutable discovery metadata together, so a Maven-configured live publish stops before uploading to any target.
+When Maven publication is configured, strict preparation reads existing `maven-metadata.xml` without authentication and includes the merged bytes in `release.json`. A private repository whose metadata cannot be read anonymously cannot use this path. Live publication requires `MAVEN_PUBLISH_USERNAME` and `MAVEN_PUBLISH_PASSWORD`. Swatch compares immutable files through public reads, uploads only missing files, and updates metadata with the repository's strong ETag. A changed ETag stops publication and requires a fresh `swatch prepare`.
 
 `verify` checks the manifest, lockfile, authored files, destinations, every prepared byte, and the source revision when Git can provide one. A live `publish` loads that verified snapshot instead of rebuilding it. The generated GitHub release workflow signs `release.json` with keyless Sigstore, creates GitHub artifact attestations, verifies both, and only then creates the release.
 
 An initialized pack declares GitHub as a destination without hard-coding an owner or repository. The generated workflow uses GitHub's `GITHUB_REPOSITORY` value. Set `publish.github.repository = "owner/repository"` when running a live GitHub publish elsewhere.
+
+Modrinth releases default to listed and featured. A pack that needs a quiet external release can own that policy in `pack.toml`:
+
+```toml
+[publish.modrinth]
+project = "project-id"
+status = "unlisted"
+featured = false
+```
 
 The existing preview remains available:
 
