@@ -119,7 +119,9 @@ jobs:
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Install Swatch
-        run: cargo install --locked --git https://github.com/iamkaf/swatch --tag vSWATCH_VERSION swatch
+        run: |
+          cargo install --locked --git https://github.com/iamkaf/swatch --tag vSWATCH_VERSION swatch
+          test "$(swatch --version)" = "swatch SWATCH_VERSION"
 
       - name: Install and check pack
         run: |
@@ -159,7 +161,9 @@ jobs:
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Install Swatch
-        run: cargo install --locked --git https://github.com/iamkaf/swatch --tag vSWATCH_VERSION swatch
+        run: |
+          cargo install --locked --git https://github.com/iamkaf/swatch --tag vSWATCH_VERSION swatch
+          test "$(swatch --version)" = "swatch SWATCH_VERSION"
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
@@ -256,11 +260,17 @@ mod tests {
         ] {
             assert!(path.join(expected).exists(), "missing {expected}");
         }
-        assert!(
-            fs::read_to_string(path.join(".github/workflows/release.yml"))
-                .expect("release workflow")
-                .contains("workflow_dispatch")
-        );
+        let check_workflow =
+            fs::read_to_string(path.join(".github/workflows/check.yml")).expect("check workflow");
+        let release_workflow = fs::read_to_string(path.join(".github/workflows/release.yml"))
+            .expect("release workflow");
+        for workflow in [&check_workflow, &release_workflow] {
+            assert!(workflow.contains(
+                "cargo install --locked --git https://github.com/iamkaf/swatch --tag v0.2.0 swatch"
+            ));
+            assert!(workflow.contains("test \"$(swatch --version)\" = \"swatch 0.2.0\""));
+        }
+        assert!(release_workflow.contains("workflow_dispatch"));
     }
 
     #[test]
