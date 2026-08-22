@@ -16,10 +16,11 @@ mod modrinth_adapter;
 use crate::hash;
 use crate::spec::Lockfile;
 use crate::{PackRoot, Result, USER_AGENT};
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +60,8 @@ struct CurseForgeConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GitHubConfig {
-    repository: String,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,15 +92,18 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactKind {
     Modrinth,
+    Server,
     CurseForge,
     Maven,
     MavenMetadata,
+    ReleaseNotes,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct Artifact {
     name: String,
     kind: ArtifactKind,
+    sha256: String,
     sha512: String,
     bytes: Vec<u8>,
 }
@@ -109,6 +114,33 @@ struct PreparedRelease {
     config: PublishConfig,
     artifacts: Vec<Artifact>,
     changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseManifest {
+    pub schema_version: u32,
+    pub pack_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    pub artifacts: Vec<ReleaseArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseArtifact {
+    pub role: String,
+    pub path: String,
+    pub media_type: String,
+    pub sha256: String,
+    pub sha512: String,
+    pub destinations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparationMode {
+    Strict,
+    Preview,
 }
 
 impl PreparedRelease {
@@ -127,7 +159,7 @@ impl PreparedRelease {
 }
 
 /// Resolve every local release artifact once.
-fn prepare(root: &PackRoot, mode: PublishMode) -> Result<PreparedRelease> {
+fn prepare(root: &PackRoot, mode: PreparationMode) -> Result<PreparedRelease> {
     let lock = crate::load_lock(root)?;
     let manifest = fs::read_to_string(root.pack_toml())?;
     let spec = crate::spec::PackSpec::parse(&manifest)?;
@@ -137,18 +169,27 @@ fn prepare(root: &PackRoot, mode: PublishMode) -> Result<PreparedRelease> {
                 .into(),
         );
     }
+    crate::authored::verify(root, &lock.authored)?;
     let config = load_config(&manifest)?;
-    let changelog = if mode == PublishMode::Publish
-        && (config.modrinth.is_some() || config.curseforge.is_some() || config.github.is_some())
-    {
-        Some(load_changelog(root, &config)?)
+    let wants_changelog = config.changelog.is_some()
+        || config.modrinth.is_some()
+        || config.curseforge.is_some()
+        || config.github.is_some();
+    let changelog = if wants_changelog {
+        match load_changelog(root, &config) {
+            Ok(changelog) => Some(changelog),
+            Err(_) if mode == PreparationMode::Preview => None,
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
     fs::create_dir_all(root.dist_dir())?;
 
-    let mrpack = crate::export::export_from_lock(root, &lock)?;
+    let mrpack = crate::export::export_from_lock(root, &lock, crate::export::BuildSide::Client)?;
     let mut artifacts = vec![artifact(&mrpack, ArtifactKind::Modrinth)?];
+    let server = crate::export::export_from_lock(root, &lock, crate::export::BuildSide::Server)?;
+    artifacts.push(artifact(&server, ArtifactKind::Server)?);
     if let Some(curseforge_config) = &config.curseforge {
         let overrides = crate::curseforge::load_config(root)?;
         let curseforge = crate::curseforge::export_from_lock(
@@ -183,6 +224,11 @@ fn prepare(root: &PackRoot, mode: PublishMode) -> Result<PreparedRelease> {
         )?;
         artifacts.push(artifact(&metadata, ArtifactKind::MavenMetadata)?);
     }
+    if let Some(changelog) = &changelog {
+        let notes = root.dist_dir().join("release-notes.md");
+        fs::write(&notes, changelog)?;
+        artifacts.push(artifact(&notes, ArtifactKind::ReleaseNotes)?);
+    }
     artifacts.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(PreparedRelease {
@@ -193,9 +239,34 @@ fn prepare(root: &PackRoot, mode: PublishMode) -> Result<PreparedRelease> {
     })
 }
 
+pub fn prepare_release(root: &PackRoot) -> Result<PathBuf> {
+    let release = prepare(root, PreparationMode::Strict)?;
+    let manifest = manifest_from_release(root, &release)?;
+    let path = root.dist_dir().join("release.json");
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+pub fn verify_release(root: &PackRoot) -> Result<ReleaseManifest> {
+    let (manifest, _) = load_prepared(root)?;
+    Ok(manifest)
+}
+
 /// Prepare once, then publish the same artifact bytes to every configured target.
 pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
-    let release = prepare(root, mode)?;
+    let release = if mode == PublishMode::DryRun {
+        let release = prepare(root, PreparationMode::Preview)?;
+        let manifest = manifest_from_release(root, &release)?;
+        let path = root.dist_dir().join("release.json");
+        let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+        bytes.push(b'\n');
+        fs::write(path, bytes)?;
+        release
+    } else {
+        load_prepared(root)?.1
+    };
     let mut output = Vec::new();
     if release.config.modrinth.is_some() {
         output.extend(if mode == PublishMode::DryRun {
@@ -253,6 +324,265 @@ fn load_changelog(root: &PackRoot, config: &PublishConfig) -> Result<String> {
     })
 }
 
+fn manifest_from_release(root: &PackRoot, release: &PreparedRelease) -> Result<ReleaseManifest> {
+    let mut artifacts = Vec::with_capacity(release.artifacts.len());
+    for artifact in &release.artifacts {
+        artifacts.push(ReleaseArtifact {
+            role: artifact_role(artifact.kind).into(),
+            path: format!("dist/{}", artifact.name),
+            media_type: artifact_media_type(artifact.kind).into(),
+            sha256: artifact.sha256.clone(),
+            sha512: artifact.sha512.clone(),
+            destinations: destinations_for(artifact.kind, &release.config),
+        });
+    }
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(ReleaseManifest {
+        schema_version: 1,
+        pack_version: release.lock.pack.version.clone(),
+        source_revision: source_revision(root),
+        artifacts,
+    })
+}
+
+fn load_prepared(root: &PackRoot) -> Result<(ReleaseManifest, PreparedRelease)> {
+    let lock = crate::load_lock(root)?;
+    let manifest_text = fs::read_to_string(root.pack_toml())?;
+    let spec = crate::spec::PackSpec::parse(&manifest_text)?;
+    if !crate::resolve::lock_matches_spec(&spec, &lock) {
+        return Err(
+            "pack.toml changed since the last install; run `swatch install` and prepare again"
+                .into(),
+        );
+    }
+    crate::authored::verify(root, &lock.authored)?;
+    let config = load_config(&manifest_text)?;
+    let path = root.dist_dir().join("release.json");
+    let bytes = fs::read(&path).map_err(|error| {
+        crate::Error::from(format!(
+            "cannot read {}: {error}; run `swatch prepare` first",
+            path.display()
+        ))
+    })?;
+    let manifest: ReleaseManifest = serde_json::from_slice(&bytes)?;
+    if manifest.schema_version != 1 {
+        return Err(format!(
+            "unsupported release.json schema version {}",
+            manifest.schema_version
+        )
+        .into());
+    }
+    if manifest.pack_version != lock.pack.version {
+        return Err(format!(
+            "release.json pack version {} does not match pack.lock.toml {}",
+            manifest.pack_version, lock.pack.version
+        )
+        .into());
+    }
+    if manifest
+        .source_revision
+        .as_deref()
+        .is_some_and(|revision| !valid_revision(revision))
+    {
+        return Err("release.json has an invalid source revision".into());
+    }
+    if let (Some(prepared), Some(current)) = (&manifest.source_revision, source_revision(root))
+        && prepared != &current
+    {
+        return Err(format!(
+            "release.json was prepared from source revision {prepared}, current revision is {current}"
+        )
+        .into());
+    }
+
+    let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
+    let mut paths = BTreeSet::new();
+    let mut roles = BTreeSet::new();
+    let mut changelog = None;
+    for record in &manifest.artifacts {
+        crate::spec::check_pack_path(&record.path)?;
+        if !record.path.starts_with("dist/") || record.path[5..].contains('/') {
+            return Err(format!(
+                "release artifact must be directly under dist/: {}",
+                record.path
+            )
+            .into());
+        }
+        if !paths.insert(record.path.as_str()) || !roles.insert(record.role.as_str()) {
+            return Err(format!("duplicate release artifact {}", record.path).into());
+        }
+        let kind = artifact_kind(&record.role)?;
+        let expected_name = expected_artifact_name(kind, &lock);
+        if record.path[5..] != expected_name {
+            return Err(format!("{} role must use dist/{expected_name}", record.role).into());
+        }
+        if record.media_type != artifact_media_type(kind) {
+            return Err(format!("{} has an unexpected media type", record.path).into());
+        }
+        if record.destinations != destinations_for(kind, &config) {
+            return Err(format!("{} destinations no longer match pack.toml", record.path).into());
+        }
+        let artifact_path = root.path.join(&record.path);
+        let artifact = artifact(&artifact_path, kind)?;
+        if artifact.sha256 != record.sha256 || artifact.sha512 != record.sha512 {
+            return Err(format!("{} does not match release.json", record.path).into());
+        }
+        if kind == ArtifactKind::ReleaseNotes {
+            changelog = Some(
+                String::from_utf8(artifact.bytes.clone())
+                    .map_err(|_| crate::Error::from(format!("{} is not UTF-8", record.path)))?,
+            );
+        }
+        artifacts.push(artifact);
+    }
+    let mut required = vec![ArtifactKind::Modrinth, ArtifactKind::Server];
+    if config.curseforge.is_some() {
+        required.push(ArtifactKind::CurseForge);
+    }
+    if config.maven.is_some() {
+        required.extend([ArtifactKind::Maven, ArtifactKind::MavenMetadata]);
+    }
+    if config.changelog.is_some()
+        || config.modrinth.is_some()
+        || config.curseforge.is_some()
+        || config.github.is_some()
+    {
+        required.push(ArtifactKind::ReleaseNotes);
+    }
+    for required in required {
+        if !artifacts.iter().any(|artifact| artifact.kind == required) {
+            return Err(format!(
+                "release.json is missing the {} artifact",
+                artifact_role(required)
+            )
+            .into());
+        }
+    }
+    if (config.changelog.is_some()
+        || config.modrinth.is_some()
+        || config.curseforge.is_some()
+        || config.github.is_some())
+        && changelog.is_none()
+    {
+        return Err("release.json is missing release notes required by a publish target".into());
+    }
+    Ok((
+        manifest,
+        PreparedRelease {
+            lock,
+            config,
+            artifacts,
+            changelog,
+        },
+    ))
+}
+
+fn artifact_role(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Modrinth => "client",
+        ArtifactKind::Server => "server",
+        ArtifactKind::CurseForge => "curseforge",
+        ArtifactKind::Maven => "maven-pom",
+        ArtifactKind::MavenMetadata => "maven-metadata",
+        ArtifactKind::ReleaseNotes => "release-notes",
+    }
+}
+
+fn artifact_kind(role: &str) -> Result<ArtifactKind> {
+    match role {
+        "client" => Ok(ArtifactKind::Modrinth),
+        "server" => Ok(ArtifactKind::Server),
+        "curseforge" => Ok(ArtifactKind::CurseForge),
+        "maven-pom" => Ok(ArtifactKind::Maven),
+        "maven-metadata" => Ok(ArtifactKind::MavenMetadata),
+        "release-notes" => Ok(ArtifactKind::ReleaseNotes),
+        other => Err(format!("unknown release artifact role `{other}`").into()),
+    }
+}
+
+fn artifact_media_type(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Modrinth | ArtifactKind::Server | ArtifactKind::CurseForge => {
+            "application/zip"
+        }
+        ArtifactKind::Maven | ArtifactKind::MavenMetadata => "application/xml",
+        ArtifactKind::ReleaseNotes => "text/markdown; charset=utf-8",
+    }
+}
+
+fn expected_artifact_name(kind: ArtifactKind, lock: &Lockfile) -> String {
+    match kind {
+        ArtifactKind::Modrinth => format!("{}-{}-client.mrpack", lock.pack.slug, lock.pack.version),
+        ArtifactKind::Server => format!("{}-{}-server.mrpack", lock.pack.slug, lock.pack.version),
+        ArtifactKind::CurseForge => {
+            format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version)
+        }
+        ArtifactKind::Maven => format!("{}-{}.pom", lock.pack.slug, lock.pack.version),
+        ArtifactKind::MavenMetadata => "maven-metadata.xml".into(),
+        ArtifactKind::ReleaseNotes => "release-notes.md".into(),
+    }
+}
+
+fn destinations_for(kind: ArtifactKind, config: &PublishConfig) -> Vec<String> {
+    let mut destinations = Vec::new();
+    match kind {
+        ArtifactKind::Modrinth => {
+            if config.github.is_some() {
+                destinations.push("github".into());
+            }
+            if config.maven.is_some() {
+                destinations.push("maven".into());
+            }
+            if config.modrinth.is_some() {
+                destinations.push("modrinth".into());
+            }
+        }
+        ArtifactKind::Server => {
+            if config.github.is_some() {
+                destinations.push("github".into());
+            }
+        }
+        ArtifactKind::CurseForge => {
+            if config.curseforge.is_some() {
+                destinations.push("curseforge".into());
+            }
+            if config.github.is_some() {
+                destinations.push("github".into());
+            }
+        }
+        ArtifactKind::Maven | ArtifactKind::MavenMetadata => {
+            if config.maven.is_some() {
+                destinations.push("maven".into());
+            }
+        }
+        ArtifactKind::ReleaseNotes => {}
+    }
+    destinations.sort();
+    destinations
+}
+
+fn source_revision(root: &PackRoot) -> Option<String> {
+    if let Ok(revision) = std::env::var("GITHUB_SHA")
+        && valid_revision(&revision)
+    {
+        return Some(revision);
+    }
+    let output = Command::new("git")
+        .current_dir(&root.path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    valid_revision(&revision).then_some(revision)
+}
+
+fn valid_revision(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn artifact(path: &Path, kind: ArtifactKind) -> Result<Artifact> {
     let bytes = fs::read(path)?;
     let name = path
@@ -264,28 +594,11 @@ fn artifact(path: &Path, kind: ArtifactKind) -> Result<Artifact> {
     let artifact = Artifact {
         name: name.into(),
         kind,
+        sha256: hash::sha256_hex(&bytes),
         sha512: hash::sha512_hex(&bytes),
         bytes,
     };
-    fs::write(
-        path.with_file_name(format!("{}.sha512", artifact.name)),
-        checksum_bytes(&artifact),
-    )?;
     Ok(artifact)
-}
-
-fn artifact_checksum(artifact: &Artifact) -> Artifact {
-    let bytes = checksum_bytes(artifact);
-    Artifact {
-        name: format!("{}.sha512", artifact.name),
-        kind: artifact.kind,
-        sha512: hash::sha512_hex(&bytes),
-        bytes,
-    }
-}
-
-fn checksum_bytes(artifact: &Artifact) -> Vec<u8> {
-    format!("{}  {}\n", artifact.sha512, artifact.name).into_bytes()
 }
 
 fn minimal_pom(group: &str, artifact: &str, version: &str, name: &str) -> String {
@@ -343,7 +656,11 @@ struct ExistingVersions {
     version: Vec<String>,
 }
 
-fn prepare_maven_metadata(lock: &Lockfile, repository: &str, mode: PublishMode) -> Result<String> {
+fn prepare_maven_metadata(
+    lock: &Lockfile,
+    repository: &str,
+    mode: PreparationMode,
+) -> Result<String> {
     let group_path = lock.pack.group.replace('.', "/");
     let url = format!(
         "{}/{}/{}/maven-metadata.xml",
@@ -352,23 +669,18 @@ fn prepare_maven_metadata(lock: &Lockfile, repository: &str, mode: PublishMode) 
         lock.pack.slug
     );
     let mut versions = BTreeSet::new();
-    if mode == PublishMode::Publish {
-        let username = std::env::var("MAVEN_PUBLISH_USERNAME")
-            .map_err(|_| crate::Error::from("set MAVEN_PUBLISH_USERNAME"))?;
-        let password = std::env::var("MAVEN_PUBLISH_PASSWORD")
-            .map_err(|_| crate::Error::from("set MAVEN_PUBLISH_PASSWORD"))?;
-        let response = http_client()?
-            .get(&url)
-            .basic_auth(username, Some(password))
-            .send()?;
+    if mode == PreparationMode::Strict {
+        let response = http_client()?.get(&url).send()?;
         if response.status().is_success() {
             let existing: ExistingMetadata =
                 quick_xml::de::from_str(&response.text()?).map_err(crate::Error::from_display)?;
             versions.extend(existing.versioning.versions.version);
         } else if response.status() != reqwest::StatusCode::NOT_FOUND {
-            return Err(
-                format!("Maven metadata lookup failed: {url}: {}", response.status()).into(),
-            );
+            return Err(format!(
+                "cannot prepare exact Maven metadata because {url} is not publicly readable: {}",
+                response.status()
+            )
+            .into());
         }
     }
     versions.insert(lock.pack.version.clone());
@@ -527,7 +839,7 @@ repository = "example/example-pack"
     #[test]
     fn preparation_retains_one_lock_and_changelog_snapshot() {
         let (_directory, root, lock) = release_root();
-        let release = prepare(&root, PublishMode::Publish).expect("prepared release");
+        let release = prepare(&root, PreparationMode::Strict).expect("prepared release");
 
         let mut replacement = lock;
         replacement.pack.version = "2.0.0".into();
@@ -559,7 +871,41 @@ repository = "example/example-pack"
     fn dry_run_does_not_require_release_notes() {
         let (_directory, root, _lock) = release_root();
         fs::remove_file(root.path.join("CHANGELOG.md")).expect("remove changelog");
-        let release = prepare(&root, PublishMode::DryRun).expect("dry-run release");
+        let release = prepare(&root, PreparationMode::Preview).expect("dry-run release");
         assert!(release.changelog.is_none());
+    }
+
+    #[test]
+    fn release_manifest_verifies_exact_prepared_bytes() {
+        let (_directory, root, _lock) = release_root();
+        let path = prepare_release(&root).expect("prepare release");
+        let manifest: ReleaseManifest =
+            serde_json::from_slice(&fs::read(path).expect("release JSON"))
+                .expect("parse release JSON");
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.pack_version, "1.0.0");
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.role == "client"
+                && artifact.destinations == ["github"]
+                && artifact.sha256.len() == 64
+                && artifact.sha512.len() == 128
+        }));
+        assert!(
+            manifest.artifacts.iter().any(|artifact| {
+                artifact.role == "server" && artifact.destinations == ["github"]
+            })
+        );
+        verify_release(&root).expect("verify release");
+
+        let client = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == "client")
+            .expect("client artifact");
+        fs::write(root.path.join(&client.path), b"changed").expect("change artifact");
+        let error = verify_release(&root)
+            .expect_err("changed artifact")
+            .to_string();
+        assert!(error.contains("does not match release.json"));
     }
 }

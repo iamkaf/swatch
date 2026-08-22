@@ -69,6 +69,7 @@ pub fn install(root: &PackRoot, options: InstallOptions) -> Result<InstallReport
         Some(lock) if resolve::lock_matches_spec(&spec, lock) => lock.clone(),
         previous => resolve::resolve_candidate(&spec, previous)?,
     };
+    lock.set_authored(crate::authored::scan(root)?);
     let verified = fetch::ensure_all(root, &lock.file)?;
     if options.curseforge {
         lock = curseforge::ensure_mappings(root, lock, &verified)?;
@@ -124,7 +125,14 @@ fn remove_entry(text: &str, query: &str) -> Result<(String, bool)> {
     let mut document =
         DocumentMut::from_str(text).map_err(|error| format!("pack.toml: {error}"))?;
     let query = query.trim();
-    for section in ["mods", "client_mods", "server_mods", "shaders"] {
+    for section in [
+        "mods",
+        "client_mods",
+        "server_mods",
+        "shaders",
+        "resource_packs",
+        "datapacks",
+    ] {
         let Some(item) = document.get_mut(section) else {
             continue;
         };
@@ -279,5 +287,43 @@ curseforge = false
             fs::read_to_string(root.lock_toml()).expect("retained lock"),
             committed
         );
+    }
+
+    #[test]
+    fn install_locks_authored_files_and_build_rejects_drift() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().to_path_buf(),
+        };
+        fs::write(
+            root.pack_toml(),
+            r#"format = 1
+
+[pack]
+name = "Example"
+slug = "example"
+version = "1.0.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "fabric"
+loader_version = "0.19.3"
+"#,
+        )
+        .expect("manifest");
+        fs::create_dir_all(root.overrides_dir().join("config")).expect("authored root");
+        let authored = root.overrides_dir().join("config/example.json");
+        fs::write(&authored, b"{}\n").expect("authored file");
+
+        install(&root, InstallOptions::default()).expect("install");
+        let lock = crate::load_lock(&root).expect("lockfile");
+        assert_eq!(lock.version, 3);
+        assert_eq!(lock.authored.len(), 1);
+        crate::build(&root, crate::BuildSide::Client).expect("locked build");
+
+        fs::write(&authored, b"{\"changed\":true}\n").expect("change authored file");
+        let error = crate::build(&root, crate::BuildSide::Client)
+            .expect_err("authored drift")
+            .to_string();
+        assert!(error.contains("authored files differ"));
     }
 }

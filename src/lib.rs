@@ -3,14 +3,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 mod archive;
+mod authored;
 pub mod authoring;
 mod curseforge;
 mod export;
 mod fetch;
 mod hash;
+pub mod init;
 pub mod publish;
 mod resolve;
 pub mod spec;
+
+pub use export::BuildSide;
 
 /// The stable name used in user-facing messages and HTTP requests.
 pub const TOOL_NAME: &str = "swatch";
@@ -149,4 +153,13 @@ pub fn load_lock(root: &PackRoot) -> Result<spec::Lockfile> {
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("missing {}; run `swatch install` first", path.display()))?;
     spec::Lockfile::parse(&text)
+}
+
+pub fn build(root: &PackRoot, side: BuildSide) -> Result<PathBuf> {
+    let spec = load_spec(root)?;
+    let lock = load_lock(root)?;
+    if !resolve::lock_matches_spec(&spec, &lock) {
+        return Err("pack.toml changed since the last install; run `swatch install` first".into());
+    }
+    export::export_from_lock(root, &lock, side)
 }

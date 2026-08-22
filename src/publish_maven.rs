@@ -155,6 +155,7 @@ mod tests {
         let artifact = super::super::Artifact {
             name: "pack.mrpack".into(),
             kind: ArtifactKind::Modrinth,
+            sha256: super::super::hash::sha256_hex(&[]),
             sha512: "a".repeat(128),
             bytes: Vec::new(),
         };

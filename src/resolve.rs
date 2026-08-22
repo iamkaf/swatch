@@ -105,8 +105,11 @@ impl Resolver {
             )
             .into());
         }
-        if requested == ContentPlacement::Shader {
-            return Ok(ContentPlacement::Shader);
+        if matches!(
+            requested,
+            ContentPlacement::Shader | ContentPlacement::ResourcePack | ContentPlacement::DataPack
+        ) {
+            return Ok(requested);
         }
         match (project.client_side.as_str(), project.server_side.as_str()) {
             (_, "unsupported") => Ok(ContentPlacement::ClientMod),
@@ -133,7 +136,9 @@ impl Resolver {
                     serde_json::to_string(&[pack.minecraft.as_str()])?,
                 ),
             ]),
-            ContentPlacement::Shader => request.query(&[(
+            ContentPlacement::Shader
+            | ContentPlacement::ResourcePack
+            | ContentPlacement::DataPack => request.query(&[(
                 "game_versions",
                 serde_json::to_string(&[pack.minecraft.as_str()])?,
             )]),
@@ -169,7 +174,9 @@ impl Resolver {
                     serde_json::to_string(&[pack.minecraft.as_str()])?,
                 ),
             ]),
-            ContentPlacement::Shader => request.query(&[(
+            ContentPlacement::Shader
+            | ContentPlacement::ResourcePack
+            | ContentPlacement::DataPack => request.query(&[(
                 "game_versions",
                 serde_json::to_string(&[pack.minecraft.as_str()])?,
             )]),

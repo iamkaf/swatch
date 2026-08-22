@@ -57,7 +57,7 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
         );
     }
 
-    let archive_path = root.dist_dir().join("copper-valley-0.1.0.mrpack");
+    let archive_path = root.dist_dir().join("copper-valley-0.1.0-client.mrpack");
     let archive = File::open(&archive_path).expect("open prepared mrpack");
     let mut archive = ZipArchive::new(archive).expect("read prepared mrpack");
     let mut index = String::new();
@@ -69,7 +69,26 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
     let index: serde_json::Value = serde_json::from_str(&index).expect("parse index");
     assert_eq!(index["dependencies"]["neoforge"], "26.2.0");
     assert!(
-        index["files"]
+        !index["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .any(|file| file["path"] == "mods/dedicated-fixture.jar")
+    );
+
+    let server_path = root.dist_dir().join("copper-valley-0.1.0-server.mrpack");
+    let mut server = ZipArchive::new(File::open(server_path).expect("server archive"))
+        .expect("read server archive");
+    let mut server_index = String::new();
+    server
+        .by_name("modrinth.index.json")
+        .expect("server index")
+        .read_to_string(&mut server_index)
+        .expect("read server index");
+    let server_index: serde_json::Value =
+        serde_json::from_str(&server_index).expect("parse server index");
+    assert!(
+        server_index["files"]
             .as_array()
             .expect("files")
             .iter()
@@ -78,6 +97,25 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
                     && file["env"]["client"] == "unsupported"
                     && file["env"]["server"] == "required"
             })
+    );
+
+    let release: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.dist_dir().join("release.json")).expect("release manifest"),
+    )
+    .expect("parse release manifest");
+    assert_eq!(release["schemaVersion"], 1);
+    assert_eq!(release["packVersion"], "0.1.0");
+    assert!(
+        release["artifacts"]
+            .as_array()
+            .expect("release artifacts")
+            .iter()
+            .all(|artifact| artifact["sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+                && artifact["sha512"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 128))
     );
 
     assert!(

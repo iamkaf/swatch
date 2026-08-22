@@ -1,6 +1,7 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use swatch::{PackRoot, TOOL_NAME, authoring, publish};
+use swatch::{BuildSide, PackRoot, TOOL_NAME, authoring, publish};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -19,6 +20,16 @@ fn run(args: Vec<String>) -> swatch::Result<()> {
         return Ok(());
     }
     let command = args.remove(0);
+    if command == "init" {
+        let options = parse_init_args(&args)?;
+        let path = swatch::init::init(&options)?;
+        println!("initialized {}", path.display());
+        return Ok(());
+    }
+    if matches!(command.as_str(), "-h" | "--help" | "help") {
+        print_help();
+        return Ok(());
+    }
     let root = PackRoot::discover(&env::current_dir()?)?;
     match command.as_str() {
         "add" => {
@@ -51,8 +62,30 @@ fn run(args: Vec<String>) -> swatch::Result<()> {
             }
             Ok(())
         }
-        "-h" | "--help" | "help" => {
-            print_help();
+        "build" => {
+            let sides = parse_build_sides(&args)?;
+            for side in sides {
+                println!("{}", swatch::build(&root, side)?.display());
+            }
+            Ok(())
+        }
+        "prepare" => {
+            if !args.is_empty() {
+                return Err(format!("invalid prepare arguments; use `{TOOL_NAME} prepare`").into());
+            }
+            println!("{}", publish::prepare_release(&root)?.display());
+            Ok(())
+        }
+        "verify" => {
+            if !args.is_empty() {
+                return Err(format!("invalid verify arguments; use `{TOOL_NAME} verify`").into());
+            }
+            let release = publish::verify_release(&root)?;
+            println!(
+                "verified {} prepared artifacts for pack {}",
+                release.artifacts.len(),
+                release.pack_version
+            );
             Ok(())
         }
         other => Err(format!("unknown command `{other}`").into()),
@@ -108,6 +141,16 @@ fn parse_add_args(
                 swatch::spec::ContentPlacement::Shader,
                 "--shader",
             )?,
+            "--resource-pack" => set_placement(
+                &mut placement_flag,
+                swatch::spec::ContentPlacement::ResourcePack,
+                "--resource-pack",
+            )?,
+            "--datapack" => set_placement(
+                &mut placement_flag,
+                swatch::spec::ContentPlacement::DataPack,
+                "--datapack",
+            )?,
             "--version" => {
                 index += 1;
                 version = Some(args.get(index).ok_or("--version requires a value")?.clone());
@@ -134,11 +177,85 @@ fn parse_add_args(
     }
     let query = query.ok_or_else(|| {
         swatch::Error::from(format!(
-            "usage: {TOOL_NAME} add <project> [--version <version>] [--client|--server|--shader]"
+            "usage: {TOOL_NAME} add <project> [--version <version>] [--client|--server|--shader|--resource-pack|--datapack]"
         ))
     })?;
     options.placement = placement_flag.map(|(placement, _)| placement);
     Ok((query, version, options))
+}
+
+fn parse_build_sides(args: &[String]) -> swatch::Result<Vec<BuildSide>> {
+    match args {
+        [side] if side == "client" => Ok(vec![BuildSide::Client]),
+        [side] if side == "server" => Ok(vec![BuildSide::Server]),
+        [side] if side == "all" => Ok(vec![BuildSide::Client, BuildSide::Server]),
+        _ => Err(format!(
+            "invalid build arguments; use `{TOOL_NAME} build client`, `{TOOL_NAME} build server`, or `{TOOL_NAME} build all`"
+        )
+        .into()),
+    }
+}
+
+fn parse_init_args(args: &[String]) -> swatch::Result<swatch::init::InitOptions> {
+    let mut path = None;
+    let mut name = None;
+    let mut slug = None;
+    let mut group = "org.example.packs".to_string();
+    let mut minecraft = None;
+    let mut loader = None;
+    let mut loader_version = None;
+    let mut index = 0;
+    while index < args.len() {
+        let value = &args[index];
+        if value.starts_with("--") {
+            let (key, inline) = value
+                .split_once('=')
+                .map_or((value.as_str(), None), |(key, value)| (key, Some(value)));
+            let option = match inline {
+                Some(value) => value.to_string(),
+                None => {
+                    index += 1;
+                    args.get(index)
+                        .ok_or_else(|| format!("{key} requires a value"))?
+                        .clone()
+                }
+            };
+            match key {
+                "--name" => name = Some(option),
+                "--slug" => slug = Some(option),
+                "--group" => group = option,
+                "--minecraft" => minecraft = Some(option),
+                "--loader" => loader = Some(option),
+                "--loader-version" => loader_version = Some(option),
+                _ => return Err(format!("unknown init option `{key}`").into()),
+            }
+        } else if path.is_none() {
+            path = Some(PathBuf::from(value));
+        } else {
+            return Err(format!("unexpected init argument `{value}`").into());
+        }
+        index += 1;
+    }
+    let path = path.unwrap_or_else(|| PathBuf::from("."));
+    let slug = slug.or_else(|| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    let required = || {
+        swatch::Error::from(format!(
+            "usage: {TOOL_NAME} init <directory> --name <name> --minecraft <version> --loader <fabric|forge|neoforge> --loader-version <version> [--slug <slug>] [--group <group>]"
+        ))
+    };
+    Ok(swatch::init::InitOptions {
+        path,
+        name: name.ok_or_else(required)?,
+        slug: slug.ok_or_else(required)?,
+        group,
+        minecraft: minecraft.ok_or_else(required)?,
+        loader: loader.ok_or_else(required)?,
+        loader_version: loader_version.ok_or_else(required)?,
+    })
 }
 
 fn set_placement(
@@ -156,14 +273,21 @@ fn set_placement(
 fn print_help() {
     eprintln!(
         "\
-Swatch — Minecraft pack authoring tool
+Swatch
+Minecraft pack authoring tool
 
-  swatch add <project>       Add a Modrinth mod or shader and install it
-  swatch remove <project>    Remove a mod or shader and install the pack
+  swatch init <directory>    Create a complete pack repository
+  swatch add <project>       Add exact-pinned Modrinth content and install it
+  swatch remove <project>    Remove content and install the pack
   swatch install              Resolve, download, and verify the pack
   swatch install --curseforge Refresh CurseForge mappings with Packwiz
-  swatch publish --dry-run    Show release upload details without uploading
-  swatch publish               Publish the prepared release to configured targets
+  swatch build client        Build the client archive
+  swatch build server        Build the dedicated server archive
+  swatch build all           Build both archives
+  swatch prepare             Prepare artifacts and write dist/release.json
+  swatch verify              Verify every prepared artifact without credentials
+  swatch publish --dry-run   Prepare and show upload details without uploading
+  swatch publish             Publish the verified dist/release.json snapshot
 "
     );
 }
@@ -210,5 +334,48 @@ mod tests {
             options.placement,
             Some(swatch::spec::ContentPlacement::ServerMod)
         );
+        let (_, _, resources) =
+            parse_add_args(&args(&["fresh", "--resource-pack"])).expect("resource pack placement");
+        assert_eq!(
+            resources.placement,
+            Some(swatch::spec::ContentPlacement::ResourcePack)
+        );
+        let (_, _, data) =
+            parse_add_args(&args(&["tectonic", "--datapack"])).expect("datapack placement");
+        assert_eq!(
+            data.placement,
+            Some(swatch::spec::ContentPlacement::DataPack)
+        );
+    }
+
+    #[test]
+    fn build_grammar_names_each_side() {
+        assert_eq!(
+            parse_build_sides(&args(&["client"])).expect("client build"),
+            [BuildSide::Client]
+        );
+        assert_eq!(
+            parse_build_sides(&args(&["all"])).expect("all builds"),
+            [BuildSide::Client, BuildSide::Server]
+        );
+        assert!(parse_build_sides(&args(&["universal"])).is_err());
+    }
+
+    #[test]
+    fn init_uses_the_directory_slug_and_requires_pack_versions() {
+        let options = parse_init_args(&args(&[
+            "example-pack",
+            "--name",
+            "Example Pack",
+            "--minecraft=26.2",
+            "--loader",
+            "neoforge",
+            "--loader-version",
+            "26.2.0",
+        ]))
+        .expect("init options");
+        assert_eq!(options.slug, "example-pack");
+        assert_eq!(options.group, "org.example.packs");
+        assert!(parse_init_args(&args(&["example-pack", "--name", "Example"])).is_err());
     }
 }
