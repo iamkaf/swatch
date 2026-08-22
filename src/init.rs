@@ -438,7 +438,7 @@ mod tests {
             .expect("setup action");
         let readme = fs::read_to_string(path.join("README.md")).expect("readme");
 
-        assert!(setup_action.contains("releases/download/v0.3.0"));
+        assert!(setup_action.contains("releases/download/v0.3.1"));
         assert!(setup_action.contains("swatch-linux-x86_64.tar.gz"));
         assert!(setup_action.contains("release-manifest.sigstore.json"));
         assert!(setup_action.contains(".sha256"));
@@ -450,7 +450,7 @@ mod tests {
             setup_action
                 .contains("gh attestation verify \"$download/$archive\" --repo iamkaf/swatch")
         );
-        assert!(setup_action.contains("swatch 0.3.0"));
+        assert!(setup_action.contains("swatch 0.3.1"));
         for generated_workflow in [&check_workflow, &release_workflow] {
             assert!(generated_workflow.contains("uses: ./.github/actions/setup-swatch"));
             assert!(!generated_workflow.contains("cargo install"));
