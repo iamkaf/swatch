@@ -53,29 +53,29 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
         String::from_utf8(stage.stdout).expect("UTF-8 stage output"),
         format!(
             "{}\n{}\n",
-            root.generated_dir().join("stage/client").display(),
-            root.generated_dir().join("stage/server").display()
+            root.stage_dir().join("client").display(),
+            root.stage_dir().join("server").display()
         )
     );
     assert!(
-        root.generated_dir()
-            .join("stage/client/mods/shared-fixture.jar")
+        root.stage_dir()
+            .join("client/mods/shared-fixture.jar")
             .is_file()
     );
     assert!(
         !root
-            .generated_dir()
-            .join("stage/client/mods/dedicated-fixture.jar")
+            .stage_dir()
+            .join("client/mods/dedicated-fixture.jar")
             .exists()
     );
     assert!(
-        root.generated_dir()
-            .join("stage/server/mods/shared-fixture.jar")
+        root.stage_dir()
+            .join("server/mods/shared-fixture.jar")
             .is_file()
     );
     assert!(
-        root.generated_dir()
-            .join("stage/server/mods/dedicated-fixture.jar")
+        root.stage_dir()
+            .join("server/mods/dedicated-fixture.jar")
             .is_file()
     );
 
@@ -156,7 +156,7 @@ fn portable_neoforge_fixture_installs_and_prepares_without_network() {
             .iter()
             .all(|artifact| artifact["path"]
                 .as_str()
-                .is_some_and(|path| path.starts_with("dist/preview/")))
+                .is_some_and(|path| path.starts_with("build/dist/preview/")))
     );
     assert!(
         release["artifacts"]

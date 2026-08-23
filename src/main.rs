@@ -305,10 +305,10 @@ Minecraft pack authoring tool
   swatch stage client        Stage the client directory tree
   swatch stage server        Stage the dedicated server directory tree
   swatch stage all           Stage both directory trees
-  swatch prepare             Prepare artifacts and write dist/release.json
+  swatch prepare             Prepare artifacts and write build/dist/release.json
   swatch verify              Verify every prepared artifact without credentials
-  swatch publish --dry-run   Write dist/release.preview.json and show upload details
-  swatch publish             Publish the verified dist/release.json snapshot
+  swatch publish --dry-run   Write build/dist/release.preview.json and show upload details
+  swatch publish             Publish the verified build/dist/release.json snapshot
   swatch --version, -V       Print the installed Swatch version
 "
     );

@@ -119,16 +119,20 @@ impl PackRoot {
         self.path.join("pack.lock.toml")
     }
 
+    pub fn build_dir(&self) -> PathBuf {
+        self.path.join("build")
+    }
+
     pub fn cache_dir(&self) -> PathBuf {
-        self.path.join(".cache")
+        self.build_dir().join("cache")
     }
 
     pub fn dist_dir(&self) -> PathBuf {
-        self.path.join("dist")
+        self.build_dir().join("dist")
     }
 
-    pub fn generated_dir(&self) -> PathBuf {
-        self.path.join("generated")
+    pub fn stage_dir(&self) -> PathBuf {
+        self.build_dir().join("stage")
     }
 
     pub fn overrides_dir(&self) -> PathBuf {

@@ -170,7 +170,7 @@ pub(super) fn preflight(root: &PackRoot, source_revision: Option<&str>) -> Resul
         release_manifest: read_proof_asset(root, RELEASE_MANIFEST_NAME)?,
         sigstore_bundle: read_proof_asset(root, SIGSTORE_BUNDLE_NAME).map_err(|error| {
             crate::Error::from(format!(
-                "cannot load GitHub proof asset {SIGSTORE_BUNDLE_NAME}: {error}; sign dist/{RELEASE_MANIFEST_NAME} before publishing"
+                "cannot load GitHub proof asset {SIGSTORE_BUNDLE_NAME}: {error}; sign build/dist/{RELEASE_MANIFEST_NAME} before publishing"
             ))
         })?,
     })
@@ -704,7 +704,7 @@ mod tests {
             .expect_err("missing Sigstore bundle")
             .to_string();
         assert!(error.contains(SIGSTORE_BUNDLE_NAME));
-        assert!(error.contains("sign dist/release.json before publishing"));
+        assert!(error.contains("sign build/dist/release.json before publishing"));
     }
 
     #[test]

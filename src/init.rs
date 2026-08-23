@@ -27,7 +27,6 @@ pub fn init(options: &InitOptions) -> Result<PathBuf> {
     fs::create_dir_all(&options.path)?;
 
     fs::write(options.path.join("pack.toml"), manifest)?;
-    fs::write(options.path.join("overrides.toml"), OVERRIDES_TOML)?;
     fs::write(options.path.join("CHANGELOG.md"), CHANGELOG)?;
     fs::write(options.path.join("README.md"), pack_readme(options))?;
     fs::write(options.path.join(".gitignore"), GITIGNORE)?;
@@ -73,7 +72,7 @@ fn pack_manifest(options: &InitOptions) -> String {
 
 fn pack_readme(options: &InitOptions) -> String {
     format!(
-        "# {}\n\nThis repository builds the Minecraft {} client and server packs with Swatch.\n\n```bash\nswatch install\nsh scripts/check\nswatch stage all\nsh scripts/check-runtime\nswatch build all\nswatch prepare\nswatch verify\n```\n\nPut files used by both sides in `overrides/`, client-only files in `client-overrides/`, and server-only files in `server-overrides/`. Run `swatch install` after changing those files so their hashes are recorded in `pack.lock.toml`. Run `swatch stage all` immediately before `scripts/check-runtime`. It materializes ordinary client and server trees under `generated/stage/`. The runtime hook can inspect those trees or pass them to a launcher.\n\nThis pack owns both check hooks. Put fast gameplay and policy checks in `scripts/check`, and expensive runtime checks in `scripts/check-runtime`. Each hook must exit with status 0 when the pack is ready. CI runs the fast hook for every pull request and push. It runs the runtime hook only on pushes to `main` and during release preparation. Swatch treats the pack contents and checks as opaque files.\n",
+        "# {}\n\nThis repository builds the Minecraft {} client and server packs with Swatch.\n\n```bash\nswatch install\nsh scripts/check\nswatch stage all\nsh scripts/check-runtime\nswatch build all\nswatch prepare\nswatch verify\n```\n\nPut files used by both sides in `overrides/`, client-only files in `client-overrides/`, and server-only files in `server-overrides/`. Run `swatch install` after changing those files so their hashes are recorded in `pack.lock.toml`. Run `swatch stage all` immediately before `scripts/check-runtime`. It materializes ordinary client and server trees under `build/stage/`. The runtime hook can inspect those trees or pass them to a launcher.\n\nThis pack owns both check hooks. Put fast gameplay and policy checks in `scripts/check`, and expensive runtime checks in `scripts/check-runtime`. Each hook must exit with status 0 when the pack is ready. CI runs the fast hook for every pull request and push. It runs the runtime hook only on pushes to `main` and during release preparation. Swatch treats the pack contents and checks as opaque files.\n",
         options.name, options.minecraft
     )
 }
@@ -101,9 +100,8 @@ fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-const OVERRIDES_TOML: &str = "[curseforge]\nadd = []\nexclude = []\n";
 const CHANGELOG: &str = "# Changelog\n\n## 0.1.0\n\n- Initial pack.\n";
-const GITIGNORE: &str = ".cache/\ndist/\ngenerated/\n";
+const GITIGNORE: &str = "build/\n";
 const CHECK_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\n# Add pack-specific checks here.\n";
 const CHECK_RUNTIME_SCRIPT: &str =
     "#!/usr/bin/env sh\nset -eu\n\n# Add pack-specific runtime checks here.\n";
@@ -283,7 +281,7 @@ jobs:
           if jq -e 'index("release.json") != null' <<<"$release_assets" >/dev/null; then
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
               --pattern release.json --dir "$existing_release"
-            cmp --silent dist/release.json "$existing_release/release.json"
+            cmp --silent build/dist/release.json "$existing_release/release.json"
           fi
           if jq -e 'index("release.json.sigstore.json") != null' \
             <<<"$release_assets" >/dev/null; then
@@ -294,19 +292,19 @@ jobs:
               --bundle "$existing_release/release.json.sigstore.json" \
               --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/heads/main" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              dist/release.json
+              build/dist/release.json
             cp "$existing_release/release.json.sigstore.json" \
-              dist/release.json.sigstore.json
+              build/dist/release.json.sigstore.json
           else
             cosign sign-blob --yes \
-              --bundle dist/release.json.sigstore.json \
-              dist/release.json
+              --bundle build/dist/release.json.sigstore.json \
+              build/dist/release.json
           fi
 
       - name: Attest prepared files
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: dist/*
+          subject-path: build/dist/*
 
       - name: Verify prepared bytes
         env:
@@ -315,11 +313,11 @@ jobs:
           set -euo pipefail
           swatch verify
           cosign verify-blob \
-            --bundle dist/release.json.sigstore.json \
+            --bundle build/dist/release.json.sigstore.json \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/heads/main" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            dist/release.json
-          for file in dist/*; do
+            build/dist/release.json
+          for file in build/dist/*; do
             gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
           done
 
@@ -327,7 +325,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-pack-release
-          path: dist/
+          path: build/dist/
           if-no-files-found: error
 
   publish:
@@ -353,7 +351,7 @@ jobs:
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: verified-pack-release
-          path: dist
+          path: build/dist
 
       - name: Reverify and publish
         env:
@@ -374,11 +372,11 @@ jobs:
           fi
           swatch verify
           cosign verify-blob \
-            --bundle dist/release.json.sigstore.json \
+            --bundle build/dist/release.json.sigstore.json \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/heads/main" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            dist/release.json
-          for file in dist/*; do
+            build/dist/release.json
+          for file in build/dist/*; do
             gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
           done
           swatch publish
@@ -438,7 +436,7 @@ mod tests {
             .expect("setup action");
         let readme = fs::read_to_string(path.join("README.md")).expect("readme");
 
-        assert!(setup_action.contains("releases/download/v0.3.1"));
+        assert!(setup_action.contains("releases/download/v0.4.0"));
         assert!(setup_action.contains("swatch-linux-x86_64.tar.gz"));
         assert!(setup_action.contains("release-manifest.sigstore.json"));
         assert!(setup_action.contains(".sha256"));
@@ -450,7 +448,7 @@ mod tests {
             setup_action
                 .contains("gh attestation verify \"$download/$archive\" --repo iamkaf/swatch")
         );
-        assert!(setup_action.contains("swatch 0.3.1"));
+        assert!(setup_action.contains("swatch 0.4.0"));
         for generated_workflow in [&check_workflow, &release_workflow] {
             assert!(generated_workflow.contains("uses: ./.github/actions/setup-swatch"));
             assert!(!generated_workflow.contains("cargo install"));
@@ -479,7 +477,7 @@ mod tests {
         assert!(release_workflow.contains("sh scripts/check-runtime"));
         assert!(readme.contains("This pack owns both check hooks."));
         assert!(readme.contains("swatch stage all"));
-        assert!(readme.contains("generated/stage/"));
+        assert!(readme.contains("build/stage/"));
         assert!(readme.contains("The runtime hook can inspect those trees"));
         assert!(readme.contains("only on pushes to `main` and during release preparation"));
         assert!(release_workflow.contains("test \"$GITHUB_REF\" = \"refs/heads/main\""));
@@ -540,14 +538,15 @@ mod tests {
         assert_eq!(release_workflow.matches("swatch prepare").count(), 1);
         assert_eq!(release_workflow.matches("cosign sign-blob").count(), 1);
         assert!(
-            release_workflow
-                .contains("cmp --silent dist/release.json \"$existing_release/release.json\"")
+            release_workflow.contains(
+                "cmp --silent build/dist/release.json \"$existing_release/release.json\""
+            )
         );
         assert!(
             release_workflow.contains("--bundle \"$existing_release/release.json.sigstore.json\"")
         );
         assert!(release_workflow.contains(
-            "cp \"$existing_release/release.json.sigstore.json\" \\\n              dist/release.json.sigstore.json"
+            "cp \"$existing_release/release.json.sigstore.json\" \\\n              build/dist/release.json.sigstore.json"
         ));
 
         assert!(release_workflow.contains("default: false\n        type: boolean"));
