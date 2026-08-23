@@ -54,9 +54,9 @@ pub(crate) fn stage_from_lock(
 }
 
 fn prepare_stage_root(root: &PackRoot) -> Result<PathBuf> {
-    let generated = root.generated_dir();
-    ensure_directory(&generated, "generated output root")?;
-    let stage = generated.join("stage");
+    let build = root.build_dir();
+    ensure_directory(&build, "build output root")?;
+    let stage = root.stage_dir();
     ensure_directory(&stage, "stage output root")?;
     Ok(stage)
 }
@@ -213,7 +213,7 @@ mod tests {
             ContentPlacement::ClientMod,
         );
         let lock = lock(vec![file.clone()], Vec::new());
-        let existing = root.generated_dir().join("stage/client/old.txt");
+        let existing = root.stage_dir().join("client/old.txt");
         fs::create_dir_all(existing.parent().expect("stage directory")).expect("stage directory");
         fs::write(&existing, b"old").expect("old stage");
 
@@ -244,7 +244,7 @@ mod tests {
             ContentPlacement::ClientMod,
         );
         cache(&root, &file, b"client");
-        let stale = root.generated_dir().join("stage/client/mods/stale.jar");
+        let stale = root.stage_dir().join("client/mods/stale.jar");
         fs::create_dir_all(stale.parent().expect("stage directory")).expect("stage directory");
         fs::write(&stale, b"stale").expect("stale file");
 
@@ -300,7 +300,7 @@ client = "2.0.0"
 
     #[cfg(unix)]
     #[test]
-    fn rejects_a_symlinked_generated_root_without_touching_its_target() {
+    fn rejects_a_symlinked_build_root_without_touching_its_target() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().expect("temporary pack");
@@ -314,17 +314,17 @@ client = "2.0.0"
             b"client",
             ContentPlacement::ClientMod,
         );
-        cache(&root, &file, b"client");
         let victim = outside.path().join("stage/client/victim.txt");
         fs::create_dir_all(victim.parent().expect("victim directory")).expect("victim directory");
         fs::write(&victim, b"keep me").expect("victim file");
-        symlink(outside.path(), root.generated_dir()).expect("generated symlink");
+        symlink(outside.path(), root.build_dir()).expect("build symlink");
+        cache(&root, &file, b"client");
 
         let error = stage_from_lock(&root, &lock(vec![file], Vec::new()), BuildSide::Client)
-            .expect_err("symlinked generated root")
+            .expect_err("symlinked build root")
             .to_string();
 
-        assert!(error.contains("generated output root cannot be a symbolic link"));
+        assert!(error.contains("build output root cannot be a symbolic link"));
         assert_eq!(fs::read(victim).expect("preserved victim"), b"keep me");
     }
 

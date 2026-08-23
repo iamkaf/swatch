@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+const DIST_PATH: &str = "build/dist";
+const DIST_PREFIX: &str = "build/dist/";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishMode {
     DryRun,
@@ -37,7 +40,7 @@ struct PublishConfig {
     #[serde(default)]
     modrinth: Option<ModrinthConfig>,
     #[serde(default, deserialize_with = "deserialize_curseforge")]
-    curseforge: Option<CurseForgeConfig>,
+    curseforge: Option<crate::curseforge::Config>,
     #[serde(default)]
     github: Option<GitHubConfig>,
     #[serde(default)]
@@ -48,13 +51,6 @@ struct PublishConfig {
 #[serde(deny_unknown_fields)]
 struct ModrinthConfig {
     project: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CurseForgeConfig {
-    project: u64,
-    author: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,7 +68,7 @@ struct MavenConfig {
 
 fn deserialize_curseforge<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<CurseForgeConfig>, D::Error>
+) -> std::result::Result<Option<crate::curseforge::Config>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -255,14 +251,8 @@ fn prepare_with_ci_environment(
     )?;
     artifacts.push(artifact(&server, ArtifactKind::Server)?);
     if let Some(curseforge_config) = &config.curseforge {
-        let overrides = crate::curseforge::load_config(root)?;
-        let curseforge = crate::curseforge::export_from_lock_to(
-            root,
-            &curseforge_config.author,
-            &lock,
-            &overrides,
-            &output_dir,
-        )?;
+        let curseforge =
+            crate::curseforge::export_from_lock_to(root, &lock, curseforge_config, &output_dir)?;
         artifacts.push(artifact(&curseforge, ArtifactKind::CurseForge)?);
     }
     if let Some(maven) = &config.maven {
@@ -469,8 +459,8 @@ fn manifest_from_release(
     preparation: ReleasePreparation,
 ) -> Result<ReleaseManifest> {
     let artifact_root = match preparation {
-        ReleasePreparation::Strict => "dist",
-        ReleasePreparation::Preview => "dist/preview",
+        ReleasePreparation::Strict => DIST_PATH,
+        ReleasePreparation::Preview => "build/dist/preview",
     };
     let mut artifacts = Vec::with_capacity(release.artifacts.len());
     for artifact in &release.artifacts {
@@ -572,9 +562,9 @@ fn load_prepared_with_github_repository(
     let mut changelog = None;
     for record in &manifest.artifacts {
         crate::spec::check_pack_path(&record.path)?;
-        if !record.path.starts_with("dist/") || record.path[5..].contains('/') {
+        if !record.path.starts_with(DIST_PREFIX) || record.path[DIST_PREFIX.len()..].contains('/') {
             return Err(format!(
-                "release artifact must be directly under dist/: {}",
+                "release artifact must be directly under build/dist/: {}",
                 record.path
             )
             .into());
@@ -584,8 +574,8 @@ fn load_prepared_with_github_repository(
         }
         let kind = artifact_kind(&record.role)?;
         let expected_name = expected_artifact_name(kind, &lock);
-        if record.path[5..] != expected_name {
-            return Err(format!("{} role must use dist/{expected_name}", record.role).into());
+        if record.path[DIST_PREFIX.len()..] != expected_name {
+            return Err(format!("{} role must use build/dist/{expected_name}", record.role).into());
         }
         if record.media_type != artifact_media_type(kind) {
             return Err(format!("{} has an unexpected media type", record.path).into());
@@ -1342,7 +1332,7 @@ author = "Example Author"
     #[test]
     fn strict_preparation_rejects_a_dirty_repository() {
         let (_directory, root, _lock) = release_root();
-        fs::write(root.path.join(".gitignore"), "dist/\n").expect("gitignore");
+        fs::write(root.path.join(".gitignore"), "build/\n").expect("gitignore");
         for arguments in [
             &["init"][..],
             &["config", "user.name", "Test Author"],
@@ -1442,7 +1432,7 @@ author = "Example Author"
             preview
                 .artifacts
                 .iter()
-                .all(|artifact| artifact.path.starts_with("dist/preview/"))
+                .all(|artifact| artifact.path.starts_with("build/dist/preview/"))
         );
         assert!(
             !fs::read_to_string(root.dist_dir().join("preview/maven-metadata.xml"))
@@ -1481,7 +1471,7 @@ author = "Example Author"
             preview
                 .artifacts
                 .iter()
-                .all(|artifact| artifact.path.starts_with("dist/preview/"))
+                .all(|artifact| artifact.path.starts_with("build/dist/preview/"))
         );
         verify_release(&root).expect("strict snapshot still verifies");
     }

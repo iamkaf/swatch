@@ -13,13 +13,9 @@ const CURSEFORGE_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Overrides {
-    curseforge: Config,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Config {
+    pub(crate) project: u64,
+    pub(crate) author: String,
     #[serde(default)]
     add: Vec<ExplicitFile>,
     #[serde(default)]
@@ -190,21 +186,21 @@ fn validate_config(config: &Config, lock: &Lockfile) -> Result<BTreeSet<String>>
     for file in &config.add {
         if !client_files.contains_key(file.id.as_str()) {
             return Err(format!(
-                "overrides.toml [[curseforge.add]] ID is not a locked client file: {}",
+                "pack.toml [[publish.curseforge.add]] ID is not a locked client file: {}",
                 file.id
             )
             .into());
         }
         if file.project_id == 0 || file.file_id == 0 {
             return Err(format!(
-                "overrides.toml [[curseforge.add]] has an invalid ID: {}",
+                "pack.toml [[publish.curseforge.add]] has an invalid ID: {}",
                 file.id
             )
             .into());
         }
         if !additions.insert(file.id.as_str()) {
             return Err(format!(
-                "duplicate overrides.toml [[curseforge.add]] ID: {}",
+                "duplicate pack.toml [[publish.curseforge.add]] ID: {}",
                 file.id
             )
             .into());
@@ -215,35 +211,35 @@ fn validate_config(config: &Config, lock: &Lockfile) -> Result<BTreeSet<String>>
     for file in &config.exclude {
         let Some(locked) = client_files.get(file.id.as_str()) else {
             return Err(format!(
-                "overrides.toml [[curseforge.exclude]] ID is not a locked client file: {}",
+                "pack.toml [[publish.curseforge.exclude]] ID is not a locked client file: {}",
                 file.id
             )
             .into());
         };
         if locked.env.server != SideRequirement::Unsupported {
             return Err(format!(
-                "overrides.toml may exclude only client-only files: {}",
+                "pack.toml may exclude only client-only CurseForge files: {}",
                 file.id
             )
             .into());
         }
         if file.reason.trim().is_empty() {
             return Err(format!(
-                "overrides.toml [[curseforge.exclude]] reason is required: {}",
+                "pack.toml [[publish.curseforge.exclude]] reason is required: {}",
                 file.id
             )
             .into());
         }
         if additions.contains(file.id.as_str()) {
             return Err(format!(
-                "overrides.toml cannot add and exclude the same file: {}",
+                "pack.toml cannot add and exclude the same CurseForge file: {}",
                 file.id
             )
             .into());
         }
         if !exclusions.insert(locked.path.clone()) {
             return Err(format!(
-                "duplicate overrides.toml [[curseforge.exclude]] ID: {}",
+                "duplicate pack.toml [[publish.curseforge.exclude]] ID: {}",
                 file.id
             )
             .into());
@@ -458,14 +454,13 @@ fn manifest_from_lock(
 
 pub(crate) fn export_from_lock_to(
     root: &PackRoot,
-    author: &str,
     lock: &Lockfile,
     config: &Config,
     output_dir: &Path,
 ) -> Result<PathBuf> {
     crate::authored::verify(root, &lock.authored)?;
     let excluded = validate_config(config, lock)?;
-    let manifest = manifest_from_lock(lock, author, &excluded)?;
+    let manifest = manifest_from_lock(lock, &config.author, &excluded)?;
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     manifest_bytes.push(b'\n');
     let name = format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version);
@@ -494,12 +489,20 @@ fn write_archive(root: &PackRoot, destination: &Path, manifest: &[u8]) -> Result
 }
 
 pub(crate) fn load_config(root: &PackRoot) -> Result<Config> {
-    let path = root.path.join("overrides.toml");
-    let text = fs::read_to_string(&path)
-        .map_err(|error| crate::Error::from(format!("{}: {error}", path.display())))?;
-    let overrides: Overrides = toml::from_str(&text)
-        .map_err(|error| crate::Error::from(format!("overrides.toml: {error}")))?;
-    Ok(overrides.curseforge)
+    let text = fs::read_to_string(root.pack_toml())?;
+    let document: toml::Value =
+        toml::from_str(&text).map_err(|error| crate::Error::from(format!("pack.toml: {error}")))?;
+    let value = document
+        .get("publish")
+        .and_then(|publish| publish.get("curseforge"))
+        .ok_or_else(|| crate::Error::from("pack.toml [publish.curseforge] is required"))?;
+    match value {
+        toml::Value::Table(_) => value.clone().try_into().map_err(|error| {
+            crate::Error::from(format!("pack.toml [publish.curseforge]: {error}"))
+        }),
+        toml::Value::Boolean(false) => Err("pack.toml [publish.curseforge] is disabled".into()),
+        _ => Err("pack.toml publish.curseforge must be false or a table".into()),
+    }
 }
 
 fn toml_string(value: &str) -> String {
@@ -587,6 +590,8 @@ mod tests {
     #[test]
     fn config_rejects_a_stale_exclusion() {
         let config = Config {
+            project: 123,
+            author: "Example Author".into(),
             add: Vec::new(),
             exclude: vec![ExcludedFile {
                 id: "missing".into(),
@@ -602,6 +607,8 @@ mod tests {
     #[test]
     fn config_rejects_excluding_a_server_file() {
         let config = Config {
+            project: 123,
+            author: "Example Author".into(),
             add: Vec::new(),
             exclude: vec![ExcludedFile {
                 id: "example".into(),
@@ -612,6 +619,40 @@ mod tests {
             .expect_err("server file exclusion")
             .to_string();
         assert!(error.contains("client-only"));
+    }
+
+    #[test]
+    fn config_is_loaded_from_the_publish_table() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().into(),
+        };
+        fs::write(
+            root.pack_toml(),
+            r#"[publish.curseforge]
+project = 123
+author = "Example Author"
+
+[[publish.curseforge.add]]
+id = "shader"
+project_id = 456
+file_id = 789
+
+[[publish.curseforge.exclude]]
+id = "client-mod"
+reason = "No compatible file is available."
+"#,
+        )
+        .expect("pack manifest");
+
+        let config = load_config(&root).expect("CurseForge config");
+
+        assert_eq!(config.project, 123);
+        assert_eq!(config.author, "Example Author");
+        assert_eq!(config.add.len(), 1);
+        assert_eq!(config.add[0].id, "shader");
+        assert_eq!(config.exclude.len(), 1);
+        assert_eq!(config.exclude[0].id, "client-mod");
     }
 
     #[test]

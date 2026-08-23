@@ -77,7 +77,7 @@ resource-pack-project = "1.9.4"
 datapack-project = "2.4.1"
 ```
 
-The generated `pack.lock.toml` records download URLs, sizes, SHA-1 and SHA-512 pins, and client/server requirements. Verified downloads live in `.cache/objects/<sha512>`.
+The generated `pack.lock.toml` records download URLs, sizes, SHA-1 and SHA-512 pins, and client/server requirements. Verified downloads live in `build/cache/objects/<sha512>`.
 
 ## Lock authored files
 
@@ -107,7 +107,7 @@ swatch stage server
 swatch stage all
 ```
 
-Staging materializes ordinary Minecraft directory trees under `generated/stage/`. It verifies the locked cache without downloading, combines shared content with the requested side, preserves every locked path, and prunes files left by an older stage. Launchers and test tools can consume these directories without understanding Swatch's lockfile.
+Staging materializes ordinary Minecraft directory trees under `build/stage/`. It verifies the locked cache without downloading, combines shared content with the requested side, preserves every locked path, and prunes files left by an older stage. Launchers and test tools can consume these directories without understanding Swatch's lockfile.
 
 ## Prepare and publish a release
 
@@ -117,7 +117,7 @@ swatch verify
 swatch publish
 ```
 
-`prepare` writes client and server archives plus `dist/release.json`. The JSON contract includes schema version 1, a strict or preview preparation mode, pack version, source revision when Git can provide one, artifact paths, media types, SHA-256 and SHA-512 hashes, and configured destinations. Preparation and verification do not read publication credentials.
+`prepare` writes client and server archives plus `build/dist/release.json`. The JSON contract includes schema version 1, a strict or preview preparation mode, pack version, source revision when Git can provide one, artifact paths, media types, SHA-256 and SHA-512 hashes, and configured destinations. Preparation and verification do not read publication credentials.
 
 When Maven publication is configured, strict preparation reads existing `maven-metadata.xml` without authentication and includes the merged bytes in `release.json`. A private repository whose metadata cannot be read anonymously cannot use this path. Live publication requires `MAVEN_PUBLISH_USERNAME` and `MAVEN_PUBLISH_PASSWORD`. Swatch compares immutable files through public reads, uploads only missing files, and updates metadata with the repository's strong ETag. A changed ETag stops publication and requires a fresh `swatch prepare`.
 
@@ -138,7 +138,7 @@ The existing preview remains available:
 swatch publish --dry-run
 ```
 
-It writes `dist/release.preview.json`, stores preview artifacts under `dist/preview/`, and prints configured upload targets without using credentials. It does not change `dist/release.json` or its prepared artifacts. Preview snapshots cannot be verified or published. A live publish reads only the strict snapshot and reads platform credentials only after strict preparation has succeeded.
+It writes `build/dist/release.preview.json`, stores preview artifacts under `build/dist/preview/`, and prints configured upload targets without using credentials. It does not change `build/dist/release.json` or its prepared artifacts. Preview snapshots cannot be verified or published. A live publish reads only the strict snapshot and reads platform credentials only after strict preparation has succeeded.
 
 ## CurseForge mappings
 
@@ -148,7 +148,7 @@ CurseForge artifact preparation uses Packwiz as an explicit adapter. Normal inst
 swatch install --curseforge
 ```
 
-Swatch looks for `packwiz` on `PATH`. Set `PACKWIZ_BIN` when it lives elsewhere. Mapping additions and exclusions live in `overrides.toml`; the `[publish.curseforge]` table supplies the CurseForge project and author.
+Swatch looks for `packwiz` on `PATH`. Set `PACKWIZ_BIN` when it lives elsewhere. Mapping additions and exclusions live beside the CurseForge project and author under `[publish.curseforge]` in `pack.toml`.
 
 ## Development
 
