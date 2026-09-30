@@ -1,5 +1,7 @@
 # Swatch
 
+> Swatch now lives in [Palette](https://github.com/iamkaf/palette/tree/main/swatch), along with the other pack tools. This repository is archived; its existing releases stay here.
+
 Swatch turns a small, exact-pinned Minecraft pack manifest into locked client and server archives. It also records the hashes of authored files, prepares release bytes once, verifies them without credentials, and publishes the verified files to configured destinations.
 
 The manifest, lockfile, and `release.json` formats are experimental. They may change until Swatch has been exercised by more real packs.
