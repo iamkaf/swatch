@@ -1,19 +1,13 @@
 use crate::hash;
-use crate::spec::{AuthoredFile, AuthoredRoot, check_pack_path};
-use crate::{PackRoot, Result};
+use crate::spec::{AuthoredFile, AuthoredRoot, Lockfile, check_pack_path};
+use crate::{BuildSide, PackRoot, Result};
 use std::fs;
 use std::path::Path;
 
-const ROOTS: [(AuthoredRoot, &str); 3] = [
-    (AuthoredRoot::Shared, "overrides"),
-    (AuthoredRoot::Client, "client-overrides"),
-    (AuthoredRoot::Server, "server-overrides"),
-];
-
 pub fn scan(root: &PackRoot) -> Result<Vec<AuthoredFile>> {
     let mut files = Vec::new();
-    for (kind, directory) in ROOTS {
-        let path = root.path.join(directory);
+    for kind in AuthoredRoot::ALL {
+        let path = root.authored_dir(kind);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -34,6 +28,35 @@ pub fn scan(root: &PackRoot) -> Result<Vec<AuthoredFile>> {
     Ok(files)
 }
 
+/// Read the locked authored files for one side, checking each against its pin. Every
+/// output reads authored bytes through here, so what ships is exactly what was locked.
+pub(crate) fn read_locked<'a>(
+    root: &PackRoot,
+    lock: &'a Lockfile,
+    side: BuildSide,
+) -> Result<Vec<(&'a AuthoredFile, Vec<u8>)>> {
+    verify(root, &lock.authored)?;
+    lock.authored
+        .iter()
+        .filter(|file| side.accepts_authored(file.root))
+        .map(|file| {
+            let bytes = fs::read(root.authored_dir(file.root).join(&file.path))?;
+            if bytes.len() as u64 != file.file_size
+                || hash::sha1_hex(&bytes) != file.sha1
+                || hash::sha512_hex(&bytes) != file.sha512
+            {
+                return Err(format!(
+                    "authored file changed during the build: {}/{}; run `swatch install` after reviewing the changes",
+                    file.root.dir_name(),
+                    file.path
+                )
+                .into());
+            }
+            Ok((file, bytes))
+        })
+        .collect()
+}
+
 pub fn verify(root: &PackRoot, expected: &[AuthoredFile]) -> Result<()> {
     let actual = scan(root)?;
     if actual == expected {
@@ -42,11 +65,11 @@ pub fn verify(root: &PackRoot, expected: &[AuthoredFile]) -> Result<()> {
 
     let expected_names: Vec<_> = expected
         .iter()
-        .map(|file| format!("{}/{}", root_name(file.root), file.path))
+        .map(|file| format!("{}/{}", file.root.dir_name(), file.path))
         .collect();
     let actual_names: Vec<_> = actual
         .iter()
-        .map(|file| format!("{}/{}", root_name(file.root), file.path))
+        .map(|file| format!("{}/{}", file.root.dir_name(), file.path))
         .collect();
     Err(format!(
         "authored files differ from pack.lock.toml (locked: {}; found: {}); run `swatch install` after reviewing the changes",
@@ -54,14 +77,6 @@ pub fn verify(root: &PackRoot, expected: &[AuthoredFile]) -> Result<()> {
         display_names(&actual_names)
     )
     .into())
-}
-
-pub fn root_name(root: AuthoredRoot) -> &'static str {
-    match root {
-        AuthoredRoot::Shared => "overrides",
-        AuthoredRoot::Client => "client-overrides",
-        AuthoredRoot::Server => "server-overrides",
-    }
 }
 
 fn scan_directory(
@@ -88,6 +103,13 @@ fn scan_directory(
             )
             .into());
         }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if is_junk(&name) {
+            return Err(
+                format!("remove junk file from authored content: {}", path.display()).into(),
+            );
+        }
         if metadata.is_dir() {
             scan_directory(base, &path, root, files)?;
             continue;
@@ -95,18 +117,11 @@ fn scan_directory(
         if !metadata.is_file() {
             return Err(format!("unsupported authored file type: {}", path.display()).into());
         }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
         if name == ".gitkeep" && metadata.len() == 0 {
             continue;
         }
         if name == ".gitkeep" {
             return Err(format!("authored placeholder must be empty: {}", path.display()).into());
-        }
-        if is_junk(&name) {
-            return Err(
-                format!("remove junk file from authored content: {}", path.display()).into(),
-            );
         }
         let relative = path
             .strip_prefix(base)
@@ -127,7 +142,7 @@ fn scan_directory(
     Ok(())
 }
 
-pub(crate) fn is_junk(name: &str) -> bool {
+fn is_junk(name: &str) -> bool {
     name == ".DS_Store"
         || name == "Thumbs.db"
         || name == "desktop.ini"
@@ -157,11 +172,20 @@ mod tests {
         let root = PackRoot {
             path: directory.path().into(),
         };
-        fs::create_dir_all(root.overrides_dir().join("config")).expect("shared root");
-        fs::create_dir_all(root.client_overrides_dir()).expect("client root");
-        fs::write(root.overrides_dir().join("config/example.json"), b"{}\n").expect("shared file");
-        fs::write(root.client_overrides_dir().join("options.txt"), b"client\n")
-            .expect("client file");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Shared).join("config"))
+            .expect("shared root");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Client)).expect("client root");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Shared)
+                .join("config/example.json"),
+            b"{}\n",
+        )
+        .expect("shared file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Client).join("options.txt"),
+            b"client\n",
+        )
+        .expect("client file");
 
         let files = scan(&root).expect("authored files");
         assert_eq!(files.len(), 2);
@@ -170,11 +194,32 @@ mod tests {
         assert_eq!(files[0].file_size, 3);
         assert_eq!(files[1].root, AuthoredRoot::Client);
 
-        fs::write(root.server_overrides_dir().join(".DS_Store"), b"junk")
-            .expect_err("missing server root");
-        fs::create_dir_all(root.server_overrides_dir()).expect("server root");
-        fs::write(root.server_overrides_dir().join(".DS_Store"), b"junk").expect("junk");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Server).join(".DS_Store"),
+            b"junk",
+        )
+        .expect_err("missing server root");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Server)).expect("server root");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Server).join(".DS_Store"),
+            b"junk",
+        )
+        .expect("junk");
         assert!(scan(&root).is_err());
+    }
+
+    #[test]
+    fn rejects_junk_directories() {
+        let directory = tempfile::tempdir().expect("temporary pack");
+        let root = PackRoot {
+            path: directory.path().into(),
+        };
+        let git = root.authored_dir(AuthoredRoot::Shared).join(".git");
+        fs::create_dir_all(&git).expect("junk directory");
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").expect("junk file");
+
+        let error = scan(&root).expect_err("junk directory").to_string();
+        assert!(error.contains("remove junk file"));
     }
 
     #[cfg(unix)]
@@ -186,11 +231,11 @@ mod tests {
         let root = PackRoot {
             path: directory.path().into(),
         };
-        fs::create_dir_all(root.overrides_dir()).expect("shared root");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Shared)).expect("shared root");
         fs::write(root.path.join("outside.txt"), b"outside").expect("outside file");
         symlink(
             root.path.join("outside.txt"),
-            root.overrides_dir().join("link.txt"),
+            root.authored_dir(AuthoredRoot::Shared).join("link.txt"),
         )
         .expect("symlink");
         assert!(scan(&root).is_err());

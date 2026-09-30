@@ -20,10 +20,6 @@ impl Resolver {
         })
     }
 
-    pub fn resolve(&self, pack: &PackMeta, content: &ContentSpec) -> Result<FileSpec> {
-        self.resolve_modrinth(pack, content)
-    }
-
     /// Resolve a project name to a Modrinth slug. Exact slugs win; a search
     /// result is accepted only when it is unambiguous.
     pub fn find_project(&self, query: &str) -> Result<String> {
@@ -124,26 +120,8 @@ impl Resolver {
         placement: ContentPlacement,
         project: &str,
     ) -> Result<String> {
-        let url = format!("{MODRINTH_API}/project/{project}/version");
-        let request = self.client.get(url);
-        let request = match placement {
-            ContentPlacement::SharedMod
-            | ContentPlacement::ClientMod
-            | ContentPlacement::ServerMod => request.query(&[
-                ("loaders", serde_json::to_string(&[pack.loader.as_str()])?),
-                (
-                    "game_versions",
-                    serde_json::to_string(&[pack.minecraft.as_str()])?,
-                ),
-            ]),
-            ContentPlacement::Shader
-            | ContentPlacement::ResourcePack
-            | ContentPlacement::DataPack => request.query(&[(
-                "game_versions",
-                serde_json::to_string(&[pack.minecraft.as_str()])?,
-            )]),
-        };
-        let versions: Vec<ModrinthVersion> = request
+        let versions: Vec<ModrinthVersion> = self
+            .versions_request(pack, placement, project)?
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)?
             .json()?;
@@ -159,29 +137,35 @@ impl Resolver {
             })
     }
 
-    fn resolve_modrinth(&self, pack: &PackMeta, content: &ContentSpec) -> Result<FileSpec> {
-        let project = &content.id;
-        let requested_version = &content.version;
-        let url = format!("{MODRINTH_API}/project/{project}/version");
-        let request = self.client.get(&url);
-        let request = match content.placement {
+    /// List a project's versions for this pack. Only mods are filtered by loader.
+    fn versions_request(
+        &self,
+        pack: &PackMeta,
+        placement: ContentPlacement,
+        project: &str,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        let request = self
+            .client
+            .get(format!("{MODRINTH_API}/project/{project}/version"));
+        let game_versions = serde_json::to_string(&[pack.minecraft.as_str()])?;
+        Ok(match placement {
             ContentPlacement::SharedMod
             | ContentPlacement::ClientMod
             | ContentPlacement::ServerMod => request.query(&[
                 ("loaders", serde_json::to_string(&[pack.loader.as_str()])?),
-                (
-                    "game_versions",
-                    serde_json::to_string(&[pack.minecraft.as_str()])?,
-                ),
+                ("game_versions", game_versions),
             ]),
             ContentPlacement::Shader
             | ContentPlacement::ResourcePack
-            | ContentPlacement::DataPack => request.query(&[(
-                "game_versions",
-                serde_json::to_string(&[pack.minecraft.as_str()])?,
-            )]),
-        };
-        let response = request
+            | ContentPlacement::DataPack => request.query(&[("game_versions", game_versions)]),
+        })
+    }
+
+    pub fn resolve(&self, pack: &PackMeta, content: &ContentSpec) -> Result<FileSpec> {
+        let project = &content.id;
+        let requested_version = &content.version;
+        let response = self
+            .versions_request(pack, content.placement, project)?
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|error| format!("could not resolve Modrinth project {project}: {error}"))?;
@@ -233,15 +217,27 @@ struct ModrinthSearchHit {
     title: String,
 }
 
+/// Build a lock for `spec`. Entries whose pin and target are unchanged keep their locked
+/// file, so editing one pin never re-resolves, and possibly rewrites, the others.
 pub fn resolve_candidate(
     spec: &crate::spec::PackSpec,
     previous: Option<&Lockfile>,
 ) -> Result<Lockfile> {
-    let resolver = Resolver::new()?;
-    let total = spec.content_count();
-    let mut files = Vec::with_capacity(total);
-    for (index, content) in spec.content().enumerate() {
-        eprintln!("[{}/{}] {}", index + 1, total, content.id);
+    let reusable = previous.filter(|lock| same_target(&spec.pack, &lock.pack));
+    let mut resolver = None;
+    let mut files = Vec::with_capacity(spec.content_count());
+    for content in spec.content() {
+        if let Some(file) =
+            reusable.and_then(|lock| lock.file.iter().find(|file| locks(file, content)))
+        {
+            files.push(file.clone());
+            continue;
+        }
+        let resolver = match &resolver {
+            Some(resolver) => resolver,
+            None => resolver.insert(Resolver::new()?),
+        };
+        eprintln!("resolving {}", content.id);
         let file = resolver.resolve(&spec.pack, content)?;
         file.validate()?;
         files.push(file);
@@ -253,20 +249,28 @@ pub fn resolve_candidate(
     Ok(lock)
 }
 
+/// Resolution depends only on the game, loader, and loader version, not on pack identity.
+fn same_target(left: &PackMeta, right: &PackMeta) -> bool {
+    left.minecraft == right.minecraft
+        && left.loader == right.loader
+        && left.loader_version == right.loader_version
+}
+
+fn locks(file: &FileSpec, content: &ContentSpec) -> bool {
+    file.id == content.id
+        && file.requested_version == content.version
+        && file.env == content.placement.env()
+        && file
+            .path
+            .starts_with(&format!("{}/", content.placement.folder()))
+}
+
 pub fn lock_matches_spec(spec: &crate::spec::PackSpec, lock: &crate::spec::Lockfile) -> bool {
-    if spec.pack != lock.pack || spec.content_count() != lock.file.len() {
-        return false;
-    }
-    spec.content().all(|content| {
-        let Some(file) = lock.file.iter().find(|file| file.id == content.id) else {
-            return false;
-        };
-        file.requested_version == content.version
-            && file.env == content.placement.env()
-            && file
-                .path
-                .starts_with(&format!("{}/", content.placement.folder()))
-    })
+    spec.pack == lock.pack
+        && spec.content_count() == lock.file.len()
+        && spec
+            .content()
+            .all(|content| lock.file.iter().any(|file| locks(file, content)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +405,43 @@ mod tests {
             files: vec![conflicting],
         };
         assert!(exact_version("example", "1.2.3", &[versions.remove(0), conflict]).is_err());
+    }
+
+    #[test]
+    fn unchanged_pins_reuse_their_locked_files_without_resolving() {
+        let manifest = r#"format = 1
+
+[pack]
+name = "Example"
+slug = "example"
+version = "1.1.0"
+group = "org.example.packs"
+minecraft = "26.2"
+loader = "fabric"
+loader_version = "0.19.3"
+
+[client_mods]
+example = "1.0.0"
+"#;
+        let spec = crate::spec::PackSpec::parse(manifest).expect("manifest");
+        let mut previous_pack = spec.pack.clone();
+        previous_pack.version = "1.0.0".into();
+        let locked = FileSpec {
+            id: "example".into(),
+            requested_version: "1.0.0".into(),
+            path: "mods/example.jar".into(),
+            file_size: 1,
+            sha1: "a".repeat(40),
+            sha512: "b".repeat(128),
+            env: ContentPlacement::ClientMod.env(),
+            downloads: vec!["https://example.invalid/example.jar".into()],
+        };
+        let previous = Lockfile::new(previous_pack, vec![locked.clone()]);
+
+        let lock = resolve_candidate(&spec, Some(&previous)).expect("reused lock");
+
+        assert_eq!(lock.pack.version, "1.1.0");
+        assert_eq!(lock.file, [locked]);
     }
 
     #[test]

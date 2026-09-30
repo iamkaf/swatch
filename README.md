@@ -77,7 +77,7 @@ resource-pack-project = "1.9.4"
 datapack-project = "2.4.1"
 ```
 
-The generated `pack.lock.toml` records download URLs, sizes, SHA-1 and SHA-512 pins, and client/server requirements. Verified downloads live in `build/cache/objects/<sha512>`.
+The generated `pack.lock.toml` records download URLs, sizes, SHA-1 and SHA-512 pins, and client/server requirements. `install` resolves only new or changed pins; every other entry keeps its locked file. `add` checks that the version resolves before it edits `pack.toml`. Verified downloads live in `build/cache/objects/<sha512>`.
 
 ## Lock authored files
 
@@ -121,7 +121,7 @@ swatch publish
 
 When Maven publication is configured, strict preparation reads existing `maven-metadata.xml` without authentication and includes the merged bytes in `release.json`. A private repository whose metadata cannot be read anonymously cannot use this path. Live publication requires `MAVEN_PUBLISH_USERNAME` and `MAVEN_PUBLISH_PASSWORD`. Swatch compares immutable files through public reads, uploads only missing files, and updates metadata with the repository's strong ETag. A changed ETag stops publication and requires a fresh `swatch prepare`.
 
-`verify` checks the manifest, lockfile, authored files, destinations, every prepared byte, and the source revision when Git can provide one. A live `publish` loads that verified snapshot instead of rebuilding it. The generated GitHub release workflow signs `release.json` with keyless Sigstore, creates GitHub artifact attestations, verifies both, and only then creates the release.
+`verify` checks the manifest, lockfile, authored files, destinations, and every prepared byte. When `release.json` records a source revision, the checkout must still be at that revision with no uncommitted changes. A live `publish` loads that verified snapshot instead of rebuilding it. The generated GitHub release workflow signs `release.json` with keyless Sigstore, creates GitHub artifact attestations, verifies both, and only then creates the release.
 
 An initialized pack declares GitHub as a destination without hard-coding an owner or repository. The generated workflow uses GitHub's `GITHUB_REPOSITORY` value. Set `publish.github.repository = "owner/repository"` when running a live GitHub publish elsewhere.
 
@@ -160,6 +160,10 @@ cargo test --locked
 
 The checked-in portable fixture runs without network access and covers NeoForge, exact pins, server-only content, the content-addressed cache, installation, side-specific staging and archives, and publication preview.
 
+## Security
+
+Use the repository's [security policy](./SECURITY.md) instead of a public issue for suspected vulnerabilities.
+
 ## License
 
-Use the repository's [security policy](./SECURITY.md) instead of a public issue for suspected vulnerabilities. Swatch is licensed under the [Apache License, Version 2.0](LICENSE).
+Swatch is licensed under the [Apache License, Version 2.0](LICENSE).

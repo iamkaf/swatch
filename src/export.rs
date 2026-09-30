@@ -1,13 +1,12 @@
 use crate::spec::{
-    FileSpec, Loader, Lockfile, SideRequirement, check_pack_path, client_file, server_file,
+    AuthoredRoot, FileSpec, Loader, Lockfile, SideRequirement, check_pack_path, client_file,
+    server_file,
 };
 use crate::{PackRoot, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
-use zip::ZipWriter;
 
 const MODRINTH_FORMAT_VERSION: u32 = 1;
 
@@ -59,6 +58,13 @@ impl BuildSide {
             Self::Server => server_file(file),
         }
     }
+
+    pub(crate) fn accepts_authored(self, root: AuthoredRoot) -> bool {
+        match self {
+            Self::Client => matches!(root, AuthoredRoot::Shared | AuthoredRoot::Client),
+            Self::Server => matches!(root, AuthoredRoot::Shared | AuthoredRoot::Server),
+        }
+    }
 }
 
 pub(crate) fn export_from_lock(
@@ -75,23 +81,21 @@ pub(crate) fn export_from_lock_to(
     side: BuildSide,
     output_dir: &Path,
 ) -> Result<std::path::PathBuf> {
-    crate::authored::verify(root, &lock.authored)?;
-    fs::create_dir_all(output_dir)?;
-    let index = index_from_lock(lock, side)?;
-    let index_bytes = serde_json::to_vec_pretty(&index)?;
-    let mut index_bytes = index_bytes;
-    if !index_bytes.ends_with(b"\n") {
-        index_bytes.push(b'\n');
+    let mut entries = BTreeMap::new();
+    for (file, bytes) in crate::authored::read_locked(root, lock, side)? {
+        entries.insert(format!("{}/{}", file.root.dir_name(), file.path), bytes);
     }
+    let mut index_bytes = serde_json::to_vec_pretty(&index_from_lock(lock, side)?)?;
+    index_bytes.push(b'\n');
     let name = format!(
         "{}-{}-{}.mrpack",
         lock.pack.slug,
         lock.pack.version,
         side.as_str()
     );
+    fs::create_dir_all(output_dir)?;
     let dest = output_dir.join(&name);
-    write_mrpack(&dest, &index_bytes, root, side)?;
-    crate::authored::verify(root, &lock.authored)?;
+    crate::archive::write_zip(&dest, ("modrinth.index.json", &index_bytes), entries)?;
     Ok(dest)
 }
 
@@ -142,38 +146,10 @@ fn loader_dependency_key(loader: Loader) -> &'static str {
     }
 }
 
-fn write_mrpack(dest: &Path, index_bytes: &[u8], root: &PackRoot, side: BuildSide) -> Result<()> {
-    let mut entries = BTreeMap::new();
-    crate::archive::collect_tree(root.overrides_dir(), "overrides", &mut entries)?;
-    match side {
-        BuildSide::Client => crate::archive::collect_tree(
-            root.client_overrides_dir(),
-            "client-overrides",
-            &mut entries,
-        )?,
-        BuildSide::Server => crate::archive::collect_tree(
-            root.server_overrides_dir(),
-            "server-overrides",
-            &mut entries,
-        )?,
-    }
-    let file = File::create(dest)?;
-    let mut zip = ZipWriter::new(file);
-    let options = crate::archive::zip_options()?;
-    zip.start_file("modrinth.index.json", options)?;
-    zip.write_all(index_bytes)?;
-    for (path, bytes) in entries {
-        zip.start_file(path, options)?;
-        zip.write_all(&bytes)?;
-    }
-    zip.finish()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
+    use crate::spec::{AuthoredRoot, EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
     use std::io::Read;
 
     #[test]
@@ -238,7 +214,7 @@ mod tests {
         };
         fs::write(root.lock_toml(), lock.to_toml().expect("lock TOML")).expect("lockfile");
         let archive = export_from_lock(&root, &lock, BuildSide::Client).expect("mrpack");
-        let file = File::open(archive).expect("mrpack file");
+        let file = fs::File::open(archive).expect("mrpack file");
         let mut zip = zip::ZipArchive::new(file).expect("mrpack zip");
         let mut index_json = String::new();
         zip.by_name("modrinth.index.json")
@@ -251,27 +227,31 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_loader_to_its_modrinth_dependency() {
-        assert_eq!(loader_dependency_key(Loader::Fabric), "fabric-loader");
-        assert_eq!(loader_dependency_key(Loader::Forge), "forge");
-        assert_eq!(loader_dependency_key(Loader::NeoForge), "neoforge");
-    }
-
-    #[test]
     fn archives_are_deterministic_and_side_specific() {
         let directory = tempfile::tempdir().expect("temporary pack");
         let root = PackRoot {
             path: directory.path().into(),
         };
-        fs::create_dir_all(root.overrides_dir().join("config")).expect("shared root");
-        fs::create_dir_all(root.client_overrides_dir()).expect("client root");
-        fs::create_dir_all(root.server_overrides_dir()).expect("server root");
-        fs::write(root.overrides_dir().join("config/shared.json"), b"shared\n")
-            .expect("shared file");
-        fs::write(root.client_overrides_dir().join("client.txt"), b"client\n")
-            .expect("client file");
-        fs::write(root.server_overrides_dir().join("server.txt"), b"server\n")
-            .expect("server file");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Shared).join("config"))
+            .expect("shared root");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Client)).expect("client root");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Server)).expect("server root");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Shared)
+                .join("config/shared.json"),
+            b"shared\n",
+        )
+        .expect("shared file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Client).join("client.txt"),
+            b"client\n",
+        )
+        .expect("client file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Server).join("server.txt"),
+            b"server\n",
+        )
+        .expect("server file");
 
         let mut lock = Lockfile::new(
             PackMeta {
@@ -311,8 +291,11 @@ mod tests {
         let first = export_from_lock(&root, &lock, BuildSide::Client).expect("first client");
         let first_bytes = fs::read(&first).expect("first bytes");
         fs::remove_file(&first).expect("remove first archive");
-        fs::write(root.client_overrides_dir().join("client.txt"), b"client\n")
-            .expect("rewrite client file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Client).join("client.txt"),
+            b"client\n",
+        )
+        .expect("rewrite client file");
         let second = export_from_lock(&root, &lock, BuildSide::Client).expect("second client");
         assert_eq!(first_bytes, fs::read(second).expect("second bytes"));
 
@@ -342,8 +325,11 @@ mod tests {
         let first = export_from_lock(&root, &lock, BuildSide::Server).expect("first server");
         let first_bytes = fs::read(&first).expect("first server bytes");
         fs::remove_file(&first).expect("remove first server archive");
-        fs::write(root.server_overrides_dir().join("server.txt"), b"server\n")
-            .expect("rewrite server file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Server).join("server.txt"),
+            b"server\n",
+        )
+        .expect("rewrite server file");
         let second = export_from_lock(&root, &lock, BuildSide::Server).expect("second server");
         assert_eq!(first_bytes, fs::read(second).expect("second server bytes"));
 

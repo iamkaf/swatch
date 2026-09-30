@@ -273,27 +273,28 @@ fn prepare_with_ci_environment(
     if let Some(maven) = &config.maven {
         let pom_name = format!("{}-{}.pom", lock.pack.slug, lock.pack.version);
         let pom = output_dir.join(&pom_name);
-        fs::write(
+        crate::write_atomic(
             &pom,
             minimal_pom(
                 &lock.pack.group,
                 &lock.pack.slug,
                 &lock.pack.version,
                 &lock.pack.name,
-            ),
+            )
+            .as_bytes(),
         )?;
         artifacts.push(artifact(&pom, ArtifactKind::Maven)?);
 
         let metadata = output_dir.join("maven-metadata.xml");
-        fs::write(
+        crate::write_atomic(
             &metadata,
-            maven::prepare_metadata(&lock, &maven.repository, mode)?,
+            maven::prepare_metadata(&lock, &maven.repository, mode)?.as_bytes(),
         )?;
         artifacts.push(artifact(&metadata, ArtifactKind::MavenMetadata)?);
     }
     if let Some(changelog) = &changelog {
         let notes = output_dir.join("release-notes.md");
-        fs::write(&notes, changelog)?;
+        crate::write_atomic(&notes, changelog.as_bytes())?;
         artifacts.push(artifact(&notes, ArtifactKind::ReleaseNotes)?);
     }
     artifacts.sort_by(|left, right| left.name.cmp(&right.name));
@@ -312,7 +313,7 @@ pub fn prepare_release(root: &PackRoot) -> Result<PathBuf> {
     let path = root.dist_dir().join("release.json");
     let mut bytes = serde_json::to_vec_pretty(&manifest)?;
     bytes.push(b'\n');
-    fs::write(&path, bytes)?;
+    crate::write_atomic(&path, &bytes)?;
     Ok(path)
 }
 
@@ -329,7 +330,7 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
         let path = root.dist_dir().join("release.preview.json");
         let mut bytes = serde_json::to_vec_pretty(&manifest)?;
         bytes.push(b'\n');
-        fs::write(path, bytes)?;
+        crate::write_atomic(&path, &bytes)?;
         (manifest, release)
     } else {
         load_prepared(root)?
@@ -439,7 +440,7 @@ fn validate_publish_credentials(
     .into())
 }
 
-fn load_config(text: &str) -> Result<PublishConfig> {
+pub(crate) fn load_config(text: &str) -> Result<PublishConfig> {
     let value: toml::Value =
         toml::from_str(text).map_err(|error| crate::Error::from(format!("pack.toml: {error}")))?;
     let Some(table) = value.get("publish") else {
@@ -562,6 +563,11 @@ fn load_prepared_with_github_repository(
             "release.json was prepared from source revision {prepared}, current revision is {current}"
         )
         .into());
+    }
+    // The prepared bytes came from a clean checkout of that revision. Uncommitted edits to
+    // pack.toml, the lockfile, or authored files would not be in them.
+    if manifest.source_revision.is_some() {
+        require_clean_repository(root)?;
     }
 
     let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
@@ -810,11 +816,11 @@ fn require_clean_repository(root: &PackRoot) -> Result<()> {
             crate::Error::from(format!("cannot inspect repository status: {error}"))
         })?;
     if !status.status.success() {
-        return Err("cannot inspect repository status before release preparation".into());
+        return Err("cannot inspect repository status for a strict release".into());
     }
     if !status.stdout.is_empty() {
         return Err(
-            "strict release preparation requires a clean repository, including no untracked non-ignored files"
+            "strict releases require a clean repository, including no untracked non-ignored files"
                 .into(),
         );
     }
@@ -1200,9 +1206,7 @@ author = "Example Author"
         assert!(release.changelog.is_none());
     }
 
-    #[test]
-    fn strict_preparation_rejects_a_dirty_repository() {
-        let (_directory, root, _lock) = release_root();
+    fn commit_pack(root: &PackRoot) {
         fs::write(root.path.join(".gitignore"), "build/\n").expect("gitignore");
         for arguments in [
             &["init"][..],
@@ -1218,6 +1222,26 @@ author = "Example Author"
                 .expect("run git");
             assert!(status.success(), "git {arguments:?}");
         }
+    }
+
+    #[test]
+    fn verification_rejects_uncommitted_source_changes() {
+        let (_directory, root, _lock) = release_root();
+        commit_pack(&root);
+        prepare_release(&root).expect("strict preparation");
+        verify_release(&root).expect("clean verification");
+
+        fs::write(root.path.join("CHANGELOG.md"), "Changed notes\n").expect("tracked change");
+        let error = verify_release(&root)
+            .expect_err("uncommitted change")
+            .to_string();
+        assert!(error.contains("require a clean repository"));
+    }
+
+    #[test]
+    fn strict_preparation_rejects_a_dirty_repository() {
+        let (_directory, root, _lock) = release_root();
+        commit_pack(&root);
         let head = git_revision(&root).expect("Git HEAD");
         let mismatch = "a".repeat(40);
         let error =
@@ -1238,7 +1262,7 @@ author = "Example Author"
         let error = prepare(&root, ReleasePreparation::Strict)
             .expect_err("tracked dirty strict preparation")
             .to_string();
-        assert!(error.contains("requires a clean repository"));
+        assert!(error.contains("require a clean repository"));
 
         fs::write(root.path.join("CHANGELOG.md"), "Original notes\n").expect("restore changelog");
         fs::write(root.path.join("untracked.txt"), "dirty\n").expect("untracked file");
@@ -1247,7 +1271,7 @@ author = "Example Author"
         let error = prepare(&root, ReleasePreparation::Strict)
             .expect_err("untracked dirty strict preparation")
             .to_string();
-        assert!(error.contains("requires a clean repository"));
+        assert!(error.contains("require a clean repository"));
     }
 
     #[test]

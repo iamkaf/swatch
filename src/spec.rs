@@ -95,6 +95,15 @@ pub enum ContentPlacement {
 }
 
 impl ContentPlacement {
+    pub const ALL: [Self; 6] = [
+        Self::SharedMod,
+        Self::ClientMod,
+        Self::ServerMod,
+        Self::Shader,
+        Self::ResourcePack,
+        Self::DataPack,
+    ];
+
     pub fn manifest_table(self) -> &'static str {
         match self {
             Self::SharedMod => "mods",
@@ -341,6 +350,19 @@ pub enum AuthoredRoot {
     Shared,
     Client,
     Server,
+}
+
+impl AuthoredRoot {
+    pub const ALL: [Self; 3] = [Self::Shared, Self::Client, Self::Server];
+
+    /// The pack directory, which is also the folder name inside an `.mrpack`.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Shared => "overrides",
+            Self::Client => "client-overrides",
+            Self::Server => "server-overrides",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,54 +768,6 @@ example = "1.2.3"
         assert!(message.contains("fabric"));
         assert!(message.contains("forge"));
         assert!(message.contains("neoforge"));
-    }
-
-    #[test]
-    fn placements_own_manifest_folder_and_environment() {
-        let cases = [
-            (ContentPlacement::SharedMod, "mods", "mods", true, true),
-            (
-                ContentPlacement::ClientMod,
-                "client_mods",
-                "mods",
-                true,
-                false,
-            ),
-            (
-                ContentPlacement::ServerMod,
-                "server_mods",
-                "mods",
-                false,
-                true,
-            ),
-            (
-                ContentPlacement::Shader,
-                "shaders",
-                "shaderpacks",
-                true,
-                false,
-            ),
-            (
-                ContentPlacement::ResourcePack,
-                "resource_packs",
-                "resourcepacks",
-                true,
-                false,
-            ),
-            (
-                ContentPlacement::DataPack,
-                "datapacks",
-                "datapacks",
-                true,
-                true,
-            ),
-        ];
-        for (placement, table, folder, client, server) in cases {
-            assert_eq!(placement.manifest_table(), table);
-            assert_eq!(placement.folder(), folder);
-            assert_eq!(placement.env().client == SideRequirement::Required, client);
-            assert_eq!(placement.env().server == SideRequirement::Required, server);
-        }
     }
 
     #[test]

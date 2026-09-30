@@ -1,4 +1,4 @@
-use crate::spec::{ContentPlacement, Lockfile};
+use crate::spec::{ContentPlacement, ContentSpec, Lockfile};
 use crate::{PackRoot, Result, curseforge, fetch, load_lock_if_present, load_spec, resolve};
 use std::fs;
 use std::io::Write;
@@ -29,21 +29,23 @@ pub fn add(
     if spec.content().any(|content| content.id == project) {
         return Err(format!("{project} is already in pack.toml").into());
     }
+    // Detection also rejects a project whose Modrinth type does not match the requested flag.
+    let requested = options.placement.unwrap_or(ContentPlacement::SharedMod);
+    let detected = resolver.project_placement(&project, requested)?;
+    let placement = options.placement.unwrap_or(detected);
     let version = match requested_version {
         Some(version) if !version.trim().is_empty() => version.to_string(),
-        _ => resolver.latest_version(
-            &spec.pack,
-            options.placement.unwrap_or(ContentPlacement::SharedMod),
-            &project,
-        )?,
+        _ => resolver.latest_version(&spec.pack, placement, &project)?,
     };
-    let detected = resolver.project_placement(
-        &project,
-        options.placement.unwrap_or(ContentPlacement::SharedMod),
-    )?;
-    let placement = options.placement.unwrap_or(detected);
-    append_modrinth(root, placement, &project, &version)?;
-    Ok(project)
+    // Resolve before editing pack.toml so a bad version leaves the manifest untouched.
+    let content = ContentSpec {
+        id: project,
+        version,
+        placement,
+    };
+    resolver.resolve(&spec.pack, &content)?.validate()?;
+    append_modrinth(root, placement, &content.id, &content.version)?;
+    Ok(content.id)
 }
 
 pub fn remove(root: &PackRoot, query: &str) -> Result<()> {
@@ -138,14 +140,7 @@ fn remove_entry(text: &str, query: &str) -> Result<(String, bool)> {
     let mut document =
         DocumentMut::from_str(text).map_err(|error| format!("pack.toml: {error}"))?;
     let query = query.trim();
-    for section in [
-        "mods",
-        "client_mods",
-        "server_mods",
-        "shaders",
-        "resource_packs",
-        "datapacks",
-    ] {
+    for section in ContentPlacement::ALL.map(ContentPlacement::manifest_table) {
         let Some(item) = document.get_mut(section) else {
             continue;
         };
@@ -170,7 +165,7 @@ fn remove_entry(text: &str, query: &str) -> Result<(String, bool)> {
 #[cfg(test)]
 mod authoring_tests {
     use super::*;
-    use crate::spec::{EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
+    use crate::spec::{AuthoredRoot, EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
 
     fn lock() -> Lockfile {
         Lockfile::new(
@@ -227,14 +222,6 @@ mod authoring_tests {
             updated,
             "format = 1\n\n[mods]\n# keep this comment\ncreate = '1' # keep this inline comment\n\n[publish]\ncurseforge = false\n"
         );
-    }
-
-    #[test]
-    fn add_options_can_target_server_content() {
-        let options = AddOptions {
-            placement: Some(ContentPlacement::ServerMod),
-        };
-        assert_eq!(options.placement, Some(ContentPlacement::ServerMod));
     }
 
     #[test]
@@ -323,8 +310,11 @@ loader_version = "0.19.3"
 "#,
         )
         .expect("manifest");
-        fs::create_dir_all(root.overrides_dir().join("config")).expect("authored root");
-        let authored = root.overrides_dir().join("config/example.json");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Shared).join("config"))
+            .expect("authored root");
+        let authored = root
+            .authored_dir(AuthoredRoot::Shared)
+            .join("config/example.json");
         fs::write(&authored, b"{}\n").expect("authored file");
 
         install(&root, InstallOptions::default()).expect("install");

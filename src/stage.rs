@@ -1,4 +1,4 @@
-use crate::spec::{AuthoredRoot, Lockfile};
+use crate::spec::Lockfile;
 use crate::{BuildSide, PackRoot, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ pub(crate) fn stage_from_lock(
     lock: &Lockfile,
     side: BuildSide,
 ) -> Result<PathBuf> {
-    crate::authored::verify(root, &lock.authored)?;
+    let authored = crate::authored::read_locked(root, lock, side)?;
     let files: Vec<_> = lock.file.iter().filter(|file| side.accepts(file)).collect();
     let verified = crate::fetch::verify_cached(root, &files)?;
 
@@ -22,30 +22,9 @@ pub(crate) fn stage_from_lock(
         crate::fetch::verify_bytes(file, &bytes)?;
         write_file(&temporary.path().join(&file.path), &bytes)?;
     }
-    for file in lock
-        .authored
-        .iter()
-        .filter(|file| side.accepts_authored(file.root))
-    {
-        let source = root
-            .path
-            .join(crate::authored::root_name(file.root))
-            .join(&file.path);
-        let bytes = fs::read(source)?;
-        if bytes.len() as u64 != file.file_size
-            || crate::hash::sha1_hex(&bytes) != file.sha1
-            || crate::hash::sha512_hex(&bytes) != file.sha512
-        {
-            return Err(format!(
-                "authored file changed while staging: {}/{}; run `swatch install` after reviewing the changes",
-                crate::authored::root_name(file.root),
-                file.path
-            )
-            .into());
-        }
+    for (file, bytes) in authored {
         write_file(&temporary.path().join(&file.path), &bytes)?;
     }
-    crate::authored::verify(root, &lock.authored)?;
 
     let destination = stage_root.join(side.as_str());
     remove_existing(&destination)?;
@@ -107,20 +86,11 @@ fn remove_existing(path: &Path) -> Result<()> {
     Ok(())
 }
 
-impl BuildSide {
-    fn accepts_authored(self, root: AuthoredRoot) -> bool {
-        match self {
-            Self::Client => matches!(root, AuthoredRoot::Shared | AuthoredRoot::Client),
-            Self::Server => matches!(root, AuthoredRoot::Shared | AuthoredRoot::Server),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash;
-    use crate::spec::{AuthoredFile, ContentPlacement, FileSpec, Loader, PackMeta};
+    use crate::spec::{AuthoredFile, AuthoredRoot, ContentPlacement, FileSpec, Loader, PackMeta};
 
     #[test]
     fn stages_locked_files_and_the_matching_authored_roots() {
@@ -365,7 +335,7 @@ client = "2.0.0"
     }
 
     fn authored(root: &PackRoot, kind: AuthoredRoot, path: &str, bytes: &[u8]) {
-        let source = root.path.join(crate::authored::root_name(kind)).join(path);
+        let source = root.authored_dir(kind).join(path);
         fs::create_dir_all(source.parent().expect("authored directory"))
             .expect("authored directory");
         fs::write(source, bytes).expect("authored file");

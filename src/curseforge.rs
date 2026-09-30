@@ -1,13 +1,11 @@
 use crate::fetch;
 use crate::spec::{CurseForgeFile, Lockfile, SideRequirement, client_file};
-use crate::{PackRoot, Result};
+use crate::{BuildSide, PackRoot, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use zip::ZipWriter;
 
 const CURSEFORGE_MANIFEST_VERSION: u32 = 1;
 
@@ -94,7 +92,9 @@ pub fn ensure_mappings(
         client_file(file)
             && !excluded.contains(&file.path)
             && file.path.starts_with("mods/")
-            && file.path.ends_with(".jar")
+            && Path::new(&file.path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
     }) {
         let source = verified.path(file)?;
         let destination = temp.path().join(&file.path);
@@ -415,7 +415,7 @@ fn manifest_from_lock(
         .collect();
     if !missing.is_empty() {
         return Err(format!(
-            "CurseForge has no locked file for: {}; run `swatch install` with PACKWIZ_BIN set before publishing",
+            "CurseForge has no locked file for: {}; run `swatch install --curseforge` before publishing",
             missing.join(", ")
         )
         .into());
@@ -458,61 +458,41 @@ pub(crate) fn export_from_lock_to(
     config: &Config,
     output_dir: &Path,
 ) -> Result<PathBuf> {
-    crate::authored::verify(root, &lock.authored)?;
     let excluded = validate_config(config, lock)?;
     let manifest = manifest_from_lock(lock, &config.author, &excluded)?;
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     manifest_bytes.push(b'\n');
+    // CurseForge has one overrides folder, so client-only authored files join the shared ones.
+    // The lockfile already rejects client output paths that collide.
+    let mut entries = BTreeMap::new();
+    for (file, bytes) in crate::authored::read_locked(root, lock, BuildSide::Client)? {
+        entries.insert(format!("overrides/{}", file.path), bytes);
+    }
     let name = format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version);
     fs::create_dir_all(output_dir)?;
     let destination = output_dir.join(&name);
-    write_archive(root, &destination, &manifest_bytes)?;
-    crate::authored::verify(root, &lock.authored)?;
+    crate::archive::write_zip(&destination, ("manifest.json", &manifest_bytes), entries)?;
     Ok(destination)
 }
 
-fn write_archive(root: &PackRoot, destination: &Path, manifest: &[u8]) -> Result<()> {
-    let mut entries = BTreeMap::new();
-    crate::archive::collect_tree(root.overrides_dir(), "overrides", &mut entries)?;
-    crate::archive::collect_tree(root.client_overrides_dir(), "overrides", &mut entries)?;
-    let file = File::create(destination)?;
-    let mut zip = ZipWriter::new(file);
-    let options = crate::archive::zip_options()?;
-    zip.start_file("manifest.json", options)?;
-    zip.write_all(manifest)?;
-    for (path, bytes) in entries {
-        zip.start_file(path, options)?;
-        zip.write_all(&bytes)?;
-    }
-    zip.finish()?;
-    Ok(())
-}
-
-pub(crate) fn load_config(root: &PackRoot) -> Result<Config> {
+fn load_config(root: &PackRoot) -> Result<Config> {
     let text = fs::read_to_string(root.pack_toml())?;
-    let document: toml::Value =
-        toml::from_str(&text).map_err(|error| crate::Error::from(format!("pack.toml: {error}")))?;
-    let value = document
-        .get("publish")
-        .and_then(|publish| publish.get("curseforge"))
-        .ok_or_else(|| crate::Error::from("pack.toml [publish.curseforge] is required"))?;
-    match value {
-        toml::Value::Table(_) => value.clone().try_into().map_err(|error| {
-            crate::Error::from(format!("pack.toml [publish.curseforge]: {error}"))
-        }),
-        toml::Value::Boolean(false) => Err("pack.toml [publish.curseforge] is disabled".into()),
-        _ => Err("pack.toml publish.curseforge must be false or a table".into()),
-    }
+    crate::publish::load_config(&text)?
+        .curseforge
+        .ok_or_else(|| {
+            "pack.toml [publish.curseforge] must be configured to refresh CurseForge mappings"
+                .into()
+        })
 }
 
 fn toml_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    toml::Value::String(value.into()).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
+    use crate::spec::{AuthoredRoot, EnvSpec, FileSpec, Loader, PackMeta, SideRequirement};
     use std::io::Read;
 
     fn lock(mapped: bool) -> Lockfile {
@@ -715,26 +695,48 @@ reason = "No compatible file is available."
         let root = PackRoot {
             path: temp.path().into(),
         };
-        fs::create_dir_all(root.overrides_dir().join("config")).expect("common overrides");
-        fs::create_dir_all(root.client_overrides_dir()).expect("client overrides");
-        fs::create_dir_all(root.server_overrides_dir()).expect("server overrides");
-        fs::write(root.overrides_dir().join("config/common.txt"), b"common").expect("common file");
-        fs::write(root.client_overrides_dir().join("client.txt"), b"client").expect("client file");
-        fs::write(root.server_overrides_dir().join("server.txt"), b"server").expect("server file");
-        let manifest =
-            manifest_from_lock(&lock(true), "Example Author", &no_exclusions()).expect("manifest");
-        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("manifest JSON");
-        manifest_bytes.push(b'\n');
-        let destination = temp.path().join("pack.zip");
-        write_archive(&root, &destination, &manifest_bytes).expect("archive");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Shared).join("config"))
+            .expect("common overrides");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Client)).expect("client overrides");
+        fs::create_dir_all(root.authored_dir(AuthoredRoot::Server)).expect("server overrides");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Shared)
+                .join("config/common.txt"),
+            b"common",
+        )
+        .expect("common file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Client).join("client.txt"),
+            b"client",
+        )
+        .expect("client file");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Server).join("server.txt"),
+            b"server",
+        )
+        .expect("server file");
+        let mut lock = lock(true);
+        lock.set_authored(crate::authored::scan(&root).expect("authored pins"));
+        let config = Config {
+            project: 123,
+            author: "Example Author".into(),
+            add: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let destination = export_from_lock_to(&root, &lock, &config, &temp.path().join("first"))
+            .expect("archive");
         let first_bytes = fs::read(&destination).expect("first archive bytes");
-        fs::write(root.overrides_dir().join("config/common.txt"), b"common")
-            .expect("rewrite common file");
-        let second = temp.path().join("pack-again.zip");
-        write_archive(&root, &second, &manifest_bytes).expect("second archive");
+        fs::write(
+            root.authored_dir(AuthoredRoot::Shared)
+                .join("config/common.txt"),
+            b"common",
+        )
+        .expect("rewrite common file");
+        let second = export_from_lock_to(&root, &lock, &config, &temp.path().join("second"))
+            .expect("second archive");
         assert_eq!(first_bytes, fs::read(second).expect("second archive bytes"));
 
-        let file = File::open(destination).expect("archive file");
+        let file = fs::File::open(destination).expect("archive file");
         let mut zip = zip::ZipArchive::new(file).expect("zip");
         let names: Vec<_> = (0..zip.len())
             .map(|index| zip.by_index(index).expect("entry").name().to_string())
