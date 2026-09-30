@@ -1228,11 +1228,19 @@ author = "Example Author"
     fn verification_rejects_uncommitted_source_changes() {
         let (_directory, root, _lock) = release_root();
         commit_pack(&root);
-        prepare_release(&root).expect("strict preparation");
-        verify_release(&root).expect("clean verification");
+        let release = prepare_with_ci_environment(&root, ReleasePreparation::Strict, None, None)
+            .expect("strict preparation");
+        let manifest = manifest_from_release(&root, &release, ReleasePreparation::Strict)
+            .expect("release manifest");
+        fs::write(
+            root.dist_dir().join("release.json"),
+            serde_json::to_vec_pretty(&manifest).expect("release JSON"),
+        )
+        .expect("write release.json");
+        load_prepared_with_github_repository(&root, None).expect("clean verification");
 
         fs::write(root.path.join("CHANGELOG.md"), "Changed notes\n").expect("tracked change");
-        let error = verify_release(&root)
+        let error = load_prepared_with_github_repository(&root, None)
             .expect_err("uncommitted change")
             .to_string();
         assert!(error.contains("require a clean repository"));
