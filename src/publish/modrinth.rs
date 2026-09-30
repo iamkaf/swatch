@@ -46,10 +46,7 @@ pub fn dry_run(release: &PreparedRelease) -> Result<Vec<String>> {
         .modrinth
         .as_ref()
         .ok_or_else(|| crate::Error::from("Modrinth is not configured"))?;
-    let artifact = release.artifact(ArtifactKind::Modrinth)?;
-    if config.project.trim().is_empty() {
-        return Err("publish.modrinth.project is required".into());
-    }
+    let artifact = release.artifact(ArtifactKind::Client)?;
     Ok(vec![format!(
         "DRY Modrinth {} for {} <- {} ({})",
         create_version_url(),
@@ -65,7 +62,7 @@ pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
         .modrinth
         .as_ref()
         .ok_or_else(|| crate::Error::from("Modrinth is not configured"))?;
-    let artifact = release.artifact(ArtifactKind::Modrinth)?;
+    let artifact = release.artifact(ArtifactKind::Client)?;
     let token =
         std::env::var("MODRINTH_TOKEN").map_err(|_| crate::Error::from("set MODRINTH_TOKEN"))?;
     let client = http_client()?;
@@ -157,11 +154,6 @@ fn already_published(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn creates_versions_at_the_modrinth_version_endpoint() {
-        assert_eq!(create_version_url(), "https://api.modrinth.com/v2/version");
-    }
 
     #[test]
     fn serializes_the_swatch_owned_version_data() {

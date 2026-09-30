@@ -1,4 +1,5 @@
-use super::{Artifact, ArtifactKind, PreparedRelease, Result};
+use super::{Artifact, ArtifactKind, PreparedRelease, ReleasePreparation, Result, xml};
+use crate::spec::{Lockfile, PackMeta};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, PRAGMA};
@@ -90,28 +91,122 @@ pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
     Ok(output)
 }
 
+/// Merge the publicly readable metadata with this release so preparation records exact bytes.
+pub(super) fn prepare_metadata(
+    lock: &Lockfile,
+    repository: &str,
+    mode: ReleasePreparation,
+) -> Result<String> {
+    let url = Locations::new(repository, &lock.pack).metadata("maven-metadata.xml");
+    let mut versions = BTreeSet::new();
+    if mode == ReleasePreparation::Strict {
+        let response = public_get(&super::http_client()?, &url)?;
+        match response.status() {
+            StatusCode::OK => {
+                let bytes = read_limited(response, MAX_METADATA_BYTES, "published Maven metadata")?;
+                let current = parse_metadata(&bytes, "published")?;
+                validate_metadata_identity(
+                    &current,
+                    &lock.pack.group,
+                    &lock.pack.slug,
+                    "published",
+                )?;
+                versions.extend(current.versioning.versions.version);
+            }
+            StatusCode::NOT_FOUND => {}
+            status => {
+                return Err(format!(
+                    "cannot prepare exact Maven metadata because {url} is not publicly readable: {status}"
+                )
+                .into());
+            }
+        }
+    }
+    versions.insert(lock.pack.version.clone());
+    let latest = versions
+        .iter()
+        .max_by(|left, right| compare_pack_versions(left, right))
+        .cloned()
+        .unwrap_or_else(|| lock.pack.version.clone());
+    Ok(metadata_xml(
+        &lock.pack.group,
+        &lock.pack.slug,
+        &latest,
+        &versions.into_iter().collect::<Vec<_>>(),
+    ))
+}
+
+fn compare_pack_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let numbers = |value: &str| {
+        let mut parts = value.split('.');
+        let parsed = [
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+        ];
+        (parts.next().is_none() && parsed.iter().all(Option::is_some))
+            .then(|| parsed.map(Option::unwrap))
+    };
+    match (numbers(left), numbers(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+pub(super) fn metadata_xml(
+    group: &str,
+    artifact: &str,
+    version: &str,
+    versions: &[String],
+) -> String {
+    let version_rows = versions
+        .iter()
+        .map(|value| format!("      <version>{}</version>\n", xml(value)))
+        .collect::<String>();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<metadata>\n\
+  <groupId>{}</groupId>\n\
+  <artifactId>{}</artifactId>\n\
+  <versioning>\n\
+    <latest>{}</latest>\n\
+    <release>{}</release>\n\
+    <versions>\n\
+{}\
+    </versions>\n\
+  </versioning>\n\
+</metadata>\n",
+        xml(group),
+        xml(artifact),
+        xml(version),
+        xml(version),
+        version_rows
+    )
+}
+
 struct Locations {
     base: String,
 }
 
 impl Locations {
+    fn new(repository: &str, pack: &PackMeta) -> Self {
+        Self {
+            base: format!(
+                "{}/{}/{}",
+                repository.trim_end_matches('/'),
+                pack.group.replace('.', "/"),
+                pack.slug
+            ),
+        }
+    }
+
     fn from_release(release: &PreparedRelease) -> Result<Self> {
         let config = release
             .config
             .maven
             .as_ref()
             .ok_or_else(|| crate::Error::from("Maven is not configured"))?;
-        if !config.repository.starts_with("https://") {
-            return Err("publish.maven.repository must use HTTPS".into());
-        }
-        Ok(Self {
-            base: format!(
-                "{}/{}/{}",
-                config.repository.trim_end_matches('/'),
-                release.lock.pack.group.replace('.', "/"),
-                release.lock.pack.slug
-            ),
-        })
+        Ok(Self::new(&config.repository, &release.lock.pack))
     }
 
     fn version_file(&self, version: &str, name: &str) -> String {
@@ -127,7 +222,7 @@ fn immutable_artifacts(release: &PreparedRelease) -> impl Iterator<Item = &Artif
     release
         .artifacts
         .iter()
-        .filter(|item| matches!(item.kind, ArtifactKind::Maven | ArtifactKind::Modrinth))
+        .filter(|item| matches!(item.kind, ArtifactKind::Maven | ArtifactKind::Client))
 }
 
 fn metadata_artifact(release: &PreparedRelease) -> Result<&Artifact> {
@@ -174,7 +269,7 @@ fn publish_immutable(
         .body(bytes.to_vec())
         .send()?;
     match response.status() {
-        StatusCode::OK => Ok(()),
+        status if status.is_success() => Ok(()),
         StatusCode::CONFLICT => match get_public(client, url, bytes.len())? {
             PublicFile::Present(remote) if remote == bytes => Ok(()),
             PublicFile::Present(_) => Err(format!(
@@ -195,12 +290,17 @@ enum PublicFile {
     Present(Vec<u8>),
 }
 
-fn get_public(client: &Client, url: &str, expected_len: usize) -> Result<PublicFile> {
-    let response = client
+/// Read without credentials and around caches, so checks see what consumers see now.
+fn public_get(client: &Client, url: &str) -> Result<Response> {
+    Ok(client
         .get(cache_busted_url(url)?)
         .header(CACHE_CONTROL, "no-cache")
         .header(PRAGMA, "no-cache")
-        .send()?;
+        .send()?)
+}
+
+fn get_public(client: &Client, url: &str, expected_len: usize) -> Result<PublicFile> {
+    let response = public_get(client, url)?;
     match response.status() {
         StatusCode::OK => Ok(PublicFile::Present(read_limited(
             response,
@@ -226,11 +326,7 @@ fn prepare_metadata_update(
     artifact: &str,
     version: &str,
 ) -> Result<MetadataUpdate> {
-    let response = client
-        .get(cache_busted_url(url)?)
-        .header(CACHE_CONTROL, "no-cache")
-        .header(PRAGMA, "no-cache")
-        .send()?;
+    let response = public_get(client, url)?;
     match response.status() {
         StatusCode::NOT_FOUND => {
             validate_metadata(&prepared.bytes, None, group, artifact, version)?;
@@ -275,7 +371,7 @@ fn put_metadata(
     };
     let response = request.body(bytes.to_vec()).send()?;
     match response.status() {
-        StatusCode::OK => Ok(()),
+        status if status.is_success() => Ok(()),
         StatusCode::PRECONDITION_FAILED => Err(
             "Maven metadata changed after preparation; run `swatch prepare` again and retry".into(),
         ),
@@ -490,7 +586,7 @@ mod tests {
             artifacts: vec![
                 artifact(
                     "example-pack-1.0.0-client.mrpack",
-                    ArtifactKind::Modrinth,
+                    ArtifactKind::Client,
                     b"client",
                 ),
                 artifact("example-pack-1.0.0.pom", ArtifactKind::Maven, b"pom"),
@@ -611,6 +707,46 @@ mod tests {
             "release-password",
         )
         .expect("idempotent conflict");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn maven_metadata_keeps_existing_versions() {
+        let metadata = metadata_xml(
+            "com.example",
+            "pack",
+            "1.2.0",
+            &["1.1.1".into(), "1.2.0".into()],
+        );
+        assert!(metadata.contains("<version>1.1.1</version>"));
+        assert!(metadata.contains("<latest>1.2.0</latest>"));
+        assert_eq!(
+            compare_pack_versions("1.10.0", "1.9.0"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn created_uploads_count_as_published() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let address = listener.local_addr().expect("server address");
+        let server = thread::spawn(move || {
+            let lookup = read_request(listener.accept().expect("lookup request").0);
+            respond(lookup.stream, 404, &[], &[]);
+            let upload = read_request(listener.accept().expect("upload request").0);
+            assert_eq!(upload.method, "PUT");
+            respond(upload.stream, 201, &[], &[]);
+        });
+
+        publish_immutable(
+            &Client::new(),
+            &format!("http://{address}/pack.mrpack"),
+            "pack.mrpack",
+            b"release bytes",
+            "release-user",
+            "release-password",
+        )
+        .expect("201 Created upload");
         server.join().expect("server thread");
     }
 

@@ -61,12 +61,6 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<toml::de::Error> for Error {
-    fn from(value: toml::de::Error) -> Self {
-        Self(format!("pack.toml: {value}"))
-    }
-}
-
 impl From<toml::ser::Error> for Error {
     fn from(value: toml::ser::Error) -> Self {
         Self(format!("toml: {value}"))
@@ -135,17 +129,23 @@ impl PackRoot {
         self.build_dir().join("stage")
     }
 
-    pub fn overrides_dir(&self) -> PathBuf {
-        self.path.join("overrides")
+    pub fn authored_dir(&self, root: spec::AuthoredRoot) -> PathBuf {
+        self.path.join(root.dir_name())
     }
+}
 
-    pub fn client_overrides_dir(&self) -> PathBuf {
-        self.path.join("client-overrides")
-    }
-
-    pub fn server_overrides_dir(&self) -> PathBuf {
-        self.path.join("server-overrides")
-    }
+/// Replace `path` only after every byte is written, so an interrupted run never leaves a
+/// truncated file under the final name.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    io::Write::write_all(&mut temporary, bytes)?;
+    temporary
+        .persist(path)
+        .map_err(|error| Error::from_display(error.error))?;
+    Ok(())
 }
 
 pub fn load_spec(root: &PackRoot) -> Result<spec::PackSpec> {

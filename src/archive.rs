@@ -1,89 +1,29 @@
 use crate::Result;
-use crate::spec::check_pack_path;
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use zip::{DateTime, write::SimpleFileOptions};
+use std::io::{Cursor, Write};
+use std::path::Path;
+use zip::{DateTime, ZipWriter, write::SimpleFileOptions};
 
-pub(crate) fn zip_options() -> Result<SimpleFileOptions> {
+/// Write a deterministic archive: `first` leads, the remaining entries follow in path order,
+/// and every entry uses the same fixed timestamp.
+pub(crate) fn write_zip(
+    dest: &Path,
+    first: (&str, &[u8]),
+    entries: BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
     let timestamp = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
         .map_err(|_| crate::Error::from("invalid fixed archive timestamp"))?;
-    Ok(SimpleFileOptions::default()
+    let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .last_modified_time(timestamp)
-        .unix_permissions(0o644))
-}
-
-pub(crate) fn collect_tree(
-    dir: PathBuf,
-    prefix: &str,
-    output: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<()> {
-    if dir.is_dir() {
-        collect_dir(&dir, prefix, output)?;
+        .unix_permissions(0o644);
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file(first.0, options)?;
+    zip.write_all(first.1)?;
+    for (path, bytes) in entries {
+        zip.start_file(path, options)?;
+        zip.write_all(&bytes)?;
     }
-    Ok(())
-}
-
-fn collect_dir(dir: &Path, prefix: &str, output: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "refusing symbolic link in pack overrides: {}",
-                path.display()
-            )
-            .into());
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == ".gitkeep" && metadata.len() == 0 {
-            continue;
-        }
-        if name == ".gitkeep" {
-            return Err(format!(
-                "authored placeholder must be empty: {}",
-                entry.path().display()
-            )
-            .into());
-        }
-        if crate::authored::is_junk(&name) {
-            return Err(format!(
-                "remove junk file from authored content: {}",
-                entry.path().display()
-            )
-            .into());
-        }
-        let archive_path = format!("{prefix}/{name}");
-        check_pack_path(&archive_path)?;
-        if metadata.is_dir() {
-            collect_dir(&path, &archive_path, output)?;
-        } else if metadata.is_file()
-            && output
-                .insert(archive_path.clone(), fs::read(&path)?)
-                .is_some()
-        {
-            return Err(format!("duplicate pack override {archive_path}").into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn merged_trees_cannot_overwrite_each_other() {
-        let first = tempfile::tempdir().expect("first override tree");
-        let second = tempfile::tempdir().expect("second override tree");
-        fs::write(first.path().join("options.txt"), "first").expect("first override");
-        fs::write(second.path().join("options.txt"), "second").expect("second override");
-
-        let mut files = BTreeMap::new();
-        collect_tree(first.path().into(), "overrides", &mut files).expect("first tree");
-        assert!(collect_tree(second.path().into(), "overrides", &mut files).is_err());
-    }
+    let bytes = zip.finish()?.into_inner();
+    crate::write_atomic(dest, &bytes)
 }

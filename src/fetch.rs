@@ -2,7 +2,7 @@ use crate::spec::FileSpec;
 use crate::{PackRoot, Result, USER_AGENT, hash};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -66,9 +66,9 @@ pub fn ensure_all(root: &PackRoot, files: &[FileSpec]) -> Result<VerifiedFiles> 
             continue;
         }
         let dest = cached_file(root, file);
-        if dest.is_file() {
-            verify_bytes(file, &fs::read(&dest)?)?;
-        } else {
+        // The cache is content-addressed, so a damaged object is replaced from its pinned URL.
+        let cached = dest.is_file() && verify_bytes(file, &fs::read(&dest)?).is_ok();
+        if !cached {
             let client = match &client {
                 Some(client) => client,
                 None => client.insert(http_client()?),
@@ -108,7 +108,12 @@ fn download(client: &reqwest::blocking::Client, file: &FileSpec) -> Result<Vec<u
         return Err(format!("{} must have one download", file.path).into());
     };
     let response = client.get(url).send()?.error_for_status()?;
-    Ok(response.bytes()?.to_vec())
+    // Stop one byte past the pin; verify_bytes then rejects an oversized body.
+    let mut bytes = Vec::new();
+    response
+        .take(file.file_size.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn http_client() -> Result<reqwest::blocking::Client> {
@@ -187,19 +192,6 @@ mod tests {
         let verified = ensure_all(&root, &[first.clone(), second.clone()]).expect("verification");
         assert_eq!(verified.path(&first).expect("first object"), object);
         assert_eq!(verified.path(&second).expect("second object"), object);
-    }
-
-    #[test]
-    fn rejects_a_corrupt_cached_object() {
-        let directory = tempfile::tempdir().expect("temporary pack");
-        let root = PackRoot {
-            path: directory.path().to_path_buf(),
-        };
-        let file = file("mods/example.jar");
-        let object = cached_file(&root, &file);
-        fs::create_dir_all(object.parent().expect("object directory")).expect("object directory");
-        fs::write(object, b"corrupt").expect("cached object");
-        assert!(ensure_all(&root, &[file]).is_err());
     }
 
     #[test]

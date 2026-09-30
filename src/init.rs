@@ -82,7 +82,7 @@ fn workflow(template: &str) -> String {
 }
 
 fn toml_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    toml::Value::String(value.into()).to_string()
 }
 
 #[cfg(unix)]

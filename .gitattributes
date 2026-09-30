@@ -1,0 +1,2 @@
+# Fixture bytes are pinned by hash, so Git must never convert their line endings.
+/tests/fixtures/** -text
