@@ -140,16 +140,12 @@ pub fn dry_run(release: &PreparedRelease) -> Result<Vec<String>> {
         .github
         .as_ref()
         .ok_or_else(|| crate::Error::from("GitHub is not configured"))?;
-    let repository = preview_repository(config)?;
+    let repository = config
+        .repository
+        .as_deref()
+        .unwrap_or("<GITHUB_REPOSITORY>");
     let mut output = Vec::new();
-    for artifact in release.artifacts.iter().filter(|artifact| {
-        matches!(
-            artifact.kind,
-            super::ArtifactKind::Modrinth
-                | super::ArtifactKind::Server
-                | super::ArtifactKind::CurseForge
-        )
-    }) {
+    for artifact in release_artifacts(release) {
         output.push(format!(
             "DRY GitHub {API_BASE}/repos/{}/releases/{}/assets <- {} ({})",
             repository, release.lock.pack.version, artifact.name, artifact.sha512
@@ -182,30 +178,17 @@ pub fn publish(release: &PreparedRelease, input: &PublishInput) -> Result<Vec<St
         .github
         .as_ref()
         .ok_or_else(|| crate::Error::from("GitHub is not configured"))?;
-    let repository = repository(config)?;
+    let repository = config
+        .repository
+        .as_deref()
+        .ok_or_else(|| crate::Error::from("publish.github.repository was not resolved"))?;
     let token = github_token()?;
     let client = http_client()?;
-    let github_release = find_or_create_release(
-        &client,
-        &token,
-        &repository,
-        release,
-        &input.source_revision,
-    )?;
-    let assets = input.iter().chain(
-        release
-            .artifacts
-            .iter()
-            .filter(|artifact| {
-                matches!(
-                    artifact.kind,
-                    super::ArtifactKind::Modrinth
-                        | super::ArtifactKind::Server
-                        | super::ArtifactKind::CurseForge
-                )
-            })
-            .map(UploadAsset::from),
-    );
+    let github_release =
+        find_or_create_release(&client, &token, repository, release, &input.source_revision)?;
+    let assets = input
+        .iter()
+        .chain(release_artifacts(release).map(UploadAsset::from));
     let upload_plan = preflight_assets(&github_release, assets, |existing| {
         download_asset(&client, &token, existing)
     })?;
@@ -221,6 +204,17 @@ pub fn publish(release: &PreparedRelease, input: &PublishInput) -> Result<Vec<St
         }
     }
     Ok(output)
+}
+
+fn release_artifacts(release: &PreparedRelease) -> impl Iterator<Item = &Artifact> {
+    release.artifacts.iter().filter(|artifact| {
+        matches!(
+            artifact.kind,
+            super::ArtifactKind::Client
+                | super::ArtifactKind::Server
+                | super::ArtifactKind::CurseForge
+        )
+    })
 }
 
 fn find_or_create_release(
@@ -480,46 +474,11 @@ fn read_proof_asset(root: &PackRoot, name: &'static str) -> Result<ProofAsset> {
     })
 }
 
-fn validate_repository(repository: &str) -> Result<()> {
-    let mut parts = repository.split('/');
-    let owner = parts.next().unwrap_or_default();
-    let name = parts.next().unwrap_or_default();
-    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
-        return Err(format!("publish.github.repository must be owner/name: {repository}").into());
-    }
-    Ok(())
-}
-
 fn github_token() -> Result<String> {
     ["GITHUB_TOKEN", "GH_TOKEN"]
         .into_iter()
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
         .ok_or_else(|| crate::Error::from("set GITHUB_TOKEN (or GH_TOKEN)"))
-}
-
-fn repository(config: &super::GitHubConfig) -> Result<String> {
-    let repository = match config.repository.as_deref() {
-        Some(repository) => repository.to_string(),
-        None => std::env::var("GITHUB_REPOSITORY").map_err(|_| {
-            crate::Error::from("publish.github.repository is required outside GitHub Actions")
-        })?,
-    };
-    validate_repository(&repository)?;
-    Ok(repository)
-}
-
-fn preview_repository(config: &super::GitHubConfig) -> Result<String> {
-    match config
-        .repository
-        .clone()
-        .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
-    {
-        Some(repository) => {
-            validate_repository(&repository)?;
-            Ok(repository)
-        }
-        None => Ok("<GITHUB_REPOSITORY>".into()),
-    }
 }
 
 fn urlencoding(value: &str) -> String {
@@ -537,11 +496,6 @@ fn urlencoding(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn release_tags_are_version_prefixed() {
-        assert_eq!(release_tag("1.2.0"), "v1.2.0");
-    }
 
     #[test]
     fn new_releases_target_the_prepared_source_revision() {

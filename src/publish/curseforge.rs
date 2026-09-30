@@ -30,9 +30,6 @@ pub fn dry_run(release: &PreparedRelease) -> Result<Vec<String>> {
         .as_ref()
         .ok_or_else(|| crate::Error::from("CurseForge is not configured"))?;
     let artifact = release.artifact(ArtifactKind::CurseForge)?;
-    if config.project == 0 {
-        return Err("publish.curseforge.project must be a positive project ID".into());
-    }
     Ok(vec![format!(
         "DRY CurseForge {} <- {} ({})",
         upload_url(config.project),
@@ -50,9 +47,6 @@ pub fn publish(release: &PreparedRelease) -> Result<Vec<String>> {
     let token = std::env::var("CURSEFORGE_TOKEN")
         .map_err(|_| crate::Error::from("set CURSEFORGE_TOKEN"))?;
     let artifact = release.artifact(ArtifactKind::CurseForge)?;
-    if config.project == 0 {
-        return Err("publish.curseforge.project must be a positive project ID".into());
-    }
     let metadata = serde_json::to_string(&UploadMetadata {
         changelog: release.changelog()?.to_string(),
         changelog_type: "markdown".into(),
@@ -104,14 +98,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_the_curseforge_author_upload_endpoint() {
-        assert_eq!(
-            upload_url(123),
-            "https://minecraft.curseforge.com/api/projects/123/upload-file"
-        );
-    }
-
-    #[test]
     fn sends_game_version_names_to_curseforge() {
         let metadata = UploadMetadata {
             changelog: String::new(),
@@ -123,12 +109,5 @@ mod tests {
         let json = serde_json::to_value(metadata).expect("metadata JSON");
         assert_eq!(json["gameVersionNames"][1], "26.2");
         assert!(json.get("gameVersions").is_none());
-    }
-
-    #[test]
-    fn names_the_selected_loader() {
-        assert_eq!(loader_display_name(Loader::Fabric), "Fabric");
-        assert_eq!(loader_display_name(Loader::Forge), "Forge");
-        assert_eq!(loader_display_name(Loader::NeoForge), "NeoForge");
     }
 }

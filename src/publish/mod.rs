@@ -4,14 +4,10 @@
 //! send files from [`PreparedRelease`]. This keeps a dry run useful and prevents
 //! a platform adapter from quietly producing a different pack.
 
-#[path = "publish_curseforge.rs"]
-mod curseforge_adapter;
-#[path = "publish_github.rs"]
-mod github_adapter;
-#[path = "publish_maven.rs"]
-mod maven_adapter;
-#[path = "publish_modrinth.rs"]
-mod modrinth_adapter;
+mod curseforge;
+mod github;
+mod maven;
+mod modrinth;
 
 use crate::hash;
 use crate::spec::Lockfile;
@@ -34,17 +30,27 @@ pub enum PublishMode {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct PublishConfig {
+pub(crate) struct PublishConfig {
     #[serde(default)]
     changelog: Option<String>,
     #[serde(default)]
     modrinth: Option<ModrinthConfig>,
     #[serde(default, deserialize_with = "deserialize_curseforge")]
-    curseforge: Option<crate::curseforge::Config>,
+    pub(crate) curseforge: Option<crate::curseforge::Config>,
     #[serde(default)]
     github: Option<GitHubConfig>,
     #[serde(default)]
     maven: Option<MavenConfig>,
+}
+
+impl PublishConfig {
+    /// Every platform target publishes a changelog, so any of them requires release notes.
+    fn needs_release_notes(&self) -> bool {
+        self.changelog.is_some()
+            || self.modrinth.is_some()
+            || self.curseforge.is_some()
+            || self.github.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,14 +91,27 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArtifactKind {
-    Modrinth,
+/// The role of one prepared file. The serialized name is the `role` in `release.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactKind {
+    Client,
     Server,
+    #[serde(rename = "curseforge")]
     CurseForge,
+    #[serde(rename = "maven-pom")]
     Maven,
     MavenMetadata,
     ReleaseNotes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Destination {
+    CurseForge,
+    GitHub,
+    Maven,
+    Modrinth,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -153,12 +172,12 @@ pub struct ReleaseModrinthTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseArtifact {
-    pub role: String,
+    pub role: ArtifactKind,
     pub path: String,
     pub media_type: String,
     pub sha256: String,
     pub sha512: String,
-    pub destinations: Vec<String>,
+    pub destinations: Vec<Destination>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,11 +236,7 @@ fn prepare_with_ci_environment(
         require_clean_repository(root)?;
         require_matching_github_revision(root, github_revision)?;
     }
-    let wants_changelog = config.changelog.is_some()
-        || config.modrinth.is_some()
-        || config.curseforge.is_some()
-        || config.github.is_some();
-    let changelog = if wants_changelog {
+    let changelog = if config.needs_release_notes() {
         match load_changelog(root, &config) {
             Ok(changelog) => Some(changelog),
             Err(_) if mode == ReleasePreparation::Preview => None,
@@ -242,7 +257,7 @@ fn prepare_with_ci_environment(
         crate::export::BuildSide::Client,
         &output_dir,
     )?;
-    let mut artifacts = vec![artifact(&mrpack, ArtifactKind::Modrinth)?];
+    let mut artifacts = vec![artifact(&mrpack, ArtifactKind::Client)?];
     let server = crate::export::export_from_lock_to(
         root,
         &lock,
@@ -256,9 +271,6 @@ fn prepare_with_ci_environment(
         artifacts.push(artifact(&curseforge, ArtifactKind::CurseForge)?);
     }
     if let Some(maven) = &config.maven {
-        if !maven.repository.starts_with("https://") {
-            return Err("publish.maven.repository must use HTTPS".into());
-        }
         let pom_name = format!("{}-{}.pom", lock.pack.slug, lock.pack.version);
         let pom = output_dir.join(&pom_name);
         fs::write(
@@ -275,7 +287,7 @@ fn prepare_with_ci_environment(
         let metadata = output_dir.join("maven-metadata.xml");
         fs::write(
             &metadata,
-            prepare_maven_metadata(&lock, &maven.repository, mode)?,
+            maven::prepare_metadata(&lock, &maven.repository, mode)?,
         )?;
         artifacts.push(artifact(&metadata, ArtifactKind::MavenMetadata)?);
     }
@@ -331,21 +343,17 @@ pub fn publish(root: &PackRoot, mode: PublishMode) -> Result<Vec<String>> {
                 .is_some_and(|value| !value.is_empty())
         },
         |target| match (mode, target) {
-            (PublishMode::DryRun, PublishTarget::GitHub) => github_adapter::dry_run(&release),
-            (PublishMode::DryRun, PublishTarget::Maven) => maven_adapter::dry_run(&release),
-            (PublishMode::DryRun, PublishTarget::Modrinth) => modrinth_adapter::dry_run(&release),
-            (PublishMode::DryRun, PublishTarget::CurseForge) => {
-                curseforge_adapter::dry_run(&release)
-            }
+            (PublishMode::DryRun, PublishTarget::GitHub) => github::dry_run(&release),
+            (PublishMode::DryRun, PublishTarget::Maven) => maven::dry_run(&release),
+            (PublishMode::DryRun, PublishTarget::Modrinth) => modrinth::dry_run(&release),
+            (PublishMode::DryRun, PublishTarget::CurseForge) => curseforge::dry_run(&release),
             (PublishMode::Publish, PublishTarget::GitHub) => {
-                let input = github_adapter::preflight(root, manifest.source_revision.as_deref())?;
-                github_adapter::publish(&release, &input)
+                let input = github::preflight(root, manifest.source_revision.as_deref())?;
+                github::publish(&release, &input)
             }
-            (PublishMode::Publish, PublishTarget::Maven) => maven_adapter::publish(&release),
-            (PublishMode::Publish, PublishTarget::Modrinth) => modrinth_adapter::publish(&release),
-            (PublishMode::Publish, PublishTarget::CurseForge) => {
-                curseforge_adapter::publish(&release)
-            }
+            (PublishMode::Publish, PublishTarget::Maven) => maven::publish(&release),
+            (PublishMode::Publish, PublishTarget::Modrinth) => modrinth::publish(&release),
+            (PublishMode::Publish, PublishTarget::CurseForge) => curseforge::publish(&release),
         },
     )?;
     if output.is_empty() {
@@ -465,7 +473,7 @@ fn manifest_from_release(
     let mut artifacts = Vec::with_capacity(release.artifacts.len());
     for artifact in &release.artifacts {
         artifacts.push(ReleaseArtifact {
-            role: artifact_role(artifact.kind).into(),
+            role: artifact.kind,
             path: format!("{artifact_root}/{}", artifact.name),
             media_type: artifact_media_type(artifact.kind).into(),
             sha256: artifact.sha256.clone(),
@@ -569,13 +577,13 @@ fn load_prepared_with_github_repository(
             )
             .into());
         }
-        if !paths.insert(record.path.as_str()) || !roles.insert(record.role.as_str()) {
+        let kind = record.role;
+        if !paths.insert(record.path.as_str()) || !roles.insert(kind) {
             return Err(format!("duplicate release artifact {}", record.path).into());
         }
-        let kind = artifact_kind(&record.role)?;
         let expected_name = expected_artifact_name(kind, &lock);
         if record.path[DIST_PREFIX.len()..] != expected_name {
-            return Err(format!("{} role must use build/dist/{expected_name}", record.role).into());
+            return Err(format!("{kind:?} artifact must use build/dist/{expected_name}").into());
         }
         if record.media_type != artifact_media_type(kind) {
             return Err(format!("{} has an unexpected media type", record.path).into());
@@ -596,36 +604,20 @@ fn load_prepared_with_github_repository(
         }
         artifacts.push(artifact);
     }
-    let mut required = vec![ArtifactKind::Modrinth, ArtifactKind::Server];
+    let mut required = vec![ArtifactKind::Client, ArtifactKind::Server];
     if config.curseforge.is_some() {
         required.push(ArtifactKind::CurseForge);
     }
     if config.maven.is_some() {
         required.extend([ArtifactKind::Maven, ArtifactKind::MavenMetadata]);
     }
-    if config.changelog.is_some()
-        || config.modrinth.is_some()
-        || config.curseforge.is_some()
-        || config.github.is_some()
-    {
+    if config.needs_release_notes() {
         required.push(ArtifactKind::ReleaseNotes);
     }
     for required in required {
         if !artifacts.iter().any(|artifact| artifact.kind == required) {
-            return Err(format!(
-                "release.json is missing the {} artifact",
-                artifact_role(required)
-            )
-            .into());
+            return Err(format!("release.json is missing the {required:?} artifact").into());
         }
-    }
-    if (config.changelog.is_some()
-        || config.modrinth.is_some()
-        || config.curseforge.is_some()
-        || config.github.is_some())
-        && changelog.is_none()
-    {
-        return Err("release.json is missing release notes required by a publish target".into());
     }
     Ok((
         manifest,
@@ -638,32 +630,9 @@ fn load_prepared_with_github_repository(
     ))
 }
 
-fn artifact_role(kind: ArtifactKind) -> &'static str {
-    match kind {
-        ArtifactKind::Modrinth => "client",
-        ArtifactKind::Server => "server",
-        ArtifactKind::CurseForge => "curseforge",
-        ArtifactKind::Maven => "maven-pom",
-        ArtifactKind::MavenMetadata => "maven-metadata",
-        ArtifactKind::ReleaseNotes => "release-notes",
-    }
-}
-
-fn artifact_kind(role: &str) -> Result<ArtifactKind> {
-    match role {
-        "client" => Ok(ArtifactKind::Modrinth),
-        "server" => Ok(ArtifactKind::Server),
-        "curseforge" => Ok(ArtifactKind::CurseForge),
-        "maven-pom" => Ok(ArtifactKind::Maven),
-        "maven-metadata" => Ok(ArtifactKind::MavenMetadata),
-        "release-notes" => Ok(ArtifactKind::ReleaseNotes),
-        other => Err(format!("unknown release artifact role `{other}`").into()),
-    }
-}
-
 fn artifact_media_type(kind: ArtifactKind) -> &'static str {
     match kind {
-        ArtifactKind::Modrinth | ArtifactKind::Server => "application/x-modrinth-modpack+zip",
+        ArtifactKind::Client | ArtifactKind::Server => "application/x-modrinth-modpack+zip",
         ArtifactKind::CurseForge => "application/zip",
         ArtifactKind::Maven | ArtifactKind::MavenMetadata => "application/xml",
         ArtifactKind::ReleaseNotes => "text/markdown; charset=utf-8",
@@ -753,7 +722,7 @@ fn validate_github_repository(repository: &str) -> Result<()> {
 
 fn expected_artifact_name(kind: ArtifactKind, lock: &Lockfile) -> String {
     match kind {
-        ArtifactKind::Modrinth => format!("{}-{}-client.mrpack", lock.pack.slug, lock.pack.version),
+        ArtifactKind::Client => format!("{}-{}-client.mrpack", lock.pack.slug, lock.pack.version),
         ArtifactKind::Server => format!("{}-{}-server.mrpack", lock.pack.slug, lock.pack.version),
         ArtifactKind::CurseForge => {
             format!("{}-{}-curseforge.zip", lock.pack.slug, lock.pack.version)
@@ -764,40 +733,28 @@ fn expected_artifact_name(kind: ArtifactKind, lock: &Lockfile) -> String {
     }
 }
 
-fn destinations_for(kind: ArtifactKind, config: &PublishConfig) -> Vec<String> {
-    let mut destinations = Vec::new();
-    match kind {
-        ArtifactKind::Modrinth => {
-            if config.github.is_some() {
-                destinations.push("github".into());
-            }
-            if config.maven.is_some() {
-                destinations.push("maven".into());
-            }
-            if config.modrinth.is_some() {
-                destinations.push("modrinth".into());
-            }
-        }
-        ArtifactKind::Server => {
-            if config.github.is_some() {
-                destinations.push("github".into());
-            }
-        }
-        ArtifactKind::CurseForge => {
-            if config.curseforge.is_some() {
-                destinations.push("curseforge".into());
-            }
-            if config.github.is_some() {
-                destinations.push("github".into());
-            }
-        }
+fn destinations_for(kind: ArtifactKind, config: &PublishConfig) -> Vec<Destination> {
+    let candidates: &[(Destination, bool)] = match kind {
+        ArtifactKind::Client => &[
+            (Destination::GitHub, config.github.is_some()),
+            (Destination::Maven, config.maven.is_some()),
+            (Destination::Modrinth, config.modrinth.is_some()),
+        ],
+        ArtifactKind::Server => &[(Destination::GitHub, config.github.is_some())],
+        ArtifactKind::CurseForge => &[
+            (Destination::CurseForge, config.curseforge.is_some()),
+            (Destination::GitHub, config.github.is_some()),
+        ],
         ArtifactKind::Maven | ArtifactKind::MavenMetadata => {
-            if config.maven.is_some() {
-                destinations.push("maven".into());
-            }
+            &[(Destination::Maven, config.maven.is_some())]
         }
-        ArtifactKind::ReleaseNotes => {}
-    }
+        ArtifactKind::ReleaseNotes => &[],
+    };
+    let mut destinations: Vec<_> = candidates
+        .iter()
+        .filter(|(_, configured)| *configured)
+        .map(|(destination, _)| *destination)
+        .collect();
     destinations.sort();
     destinations
 }
@@ -923,108 +880,6 @@ pub(crate) fn http_client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ExistingMetadata {
-    #[serde(default)]
-    versioning: ExistingVersioning,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ExistingVersioning {
-    #[serde(default)]
-    versions: ExistingVersions,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ExistingVersions {
-    #[serde(default)]
-    version: Vec<String>,
-}
-
-fn prepare_maven_metadata(
-    lock: &Lockfile,
-    repository: &str,
-    mode: ReleasePreparation,
-) -> Result<String> {
-    let group_path = lock.pack.group.replace('.', "/");
-    let url = format!(
-        "{}/{}/{}/maven-metadata.xml",
-        repository.trim_end_matches('/'),
-        group_path,
-        lock.pack.slug
-    );
-    let mut versions = BTreeSet::new();
-    if mode == ReleasePreparation::Strict {
-        let response = http_client()?.get(&url).send()?;
-        if response.status().is_success() {
-            let existing: ExistingMetadata =
-                quick_xml::de::from_str(&response.text()?).map_err(crate::Error::from_display)?;
-            versions.extend(existing.versioning.versions.version);
-        } else if response.status() != reqwest::StatusCode::NOT_FOUND {
-            return Err(format!(
-                "cannot prepare exact Maven metadata because {url} is not publicly readable: {}",
-                response.status()
-            )
-            .into());
-        }
-    }
-    versions.insert(lock.pack.version.clone());
-    let latest = versions
-        .iter()
-        .max_by(|left, right| compare_pack_versions(left, right))
-        .cloned()
-        .unwrap_or_else(|| lock.pack.version.clone());
-    Ok(metadata_xml(
-        &lock.pack.group,
-        &lock.pack.slug,
-        &latest,
-        &versions.into_iter().collect::<Vec<_>>(),
-    ))
-}
-
-fn compare_pack_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let numbers = |value: &str| {
-        let mut parts = value.split('.');
-        let parsed = [
-            parts.next().and_then(|part| part.parse::<u64>().ok()),
-            parts.next().and_then(|part| part.parse::<u64>().ok()),
-            parts.next().and_then(|part| part.parse::<u64>().ok()),
-        ];
-        (parts.next().is_none() && parsed.iter().all(Option::is_some))
-            .then(|| parsed.map(Option::unwrap))
-    };
-    match (numbers(left), numbers(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
-}
-
-fn metadata_xml(group: &str, artifact: &str, version: &str, versions: &[String]) -> String {
-    let version_rows = versions
-        .iter()
-        .map(|value| format!("      <version>{}</version>\n", xml(value)))
-        .collect::<String>();
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-<metadata>\n\
-  <groupId>{}</groupId>\n\
-  <artifactId>{}</artifactId>\n\
-  <versioning>\n\
-    <latest>{}</latest>\n\
-    <release>{}</release>\n\
-    <versions>\n\
-{}\
-    </versions>\n\
-  </versioning>\n\
-</metadata>\n",
-        xml(group),
-        xml(artifact),
-        xml(version),
-        xml(version),
-        version_rows
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,19 +947,35 @@ repository = "example/example-pack"
     }
 
     #[test]
-    fn maven_metadata_keeps_existing_versions() {
-        let metadata = metadata_xml(
-            "com.example",
-            "pack",
-            "1.2.0",
-            &["1.1.1".into(), "1.2.0".into()],
-        );
-        assert!(metadata.contains("<version>1.1.1</version>"));
-        assert!(metadata.contains("<latest>1.2.0</latest>"));
+    fn release_json_keeps_its_role_and_destination_names() {
+        let roles = [
+            ArtifactKind::Client,
+            ArtifactKind::Server,
+            ArtifactKind::CurseForge,
+            ArtifactKind::Maven,
+            ArtifactKind::MavenMetadata,
+            ArtifactKind::ReleaseNotes,
+        ]
+        .map(|role| serde_json::to_value(role).expect("role JSON"));
         assert_eq!(
-            compare_pack_versions("1.10.0", "1.9.0"),
-            std::cmp::Ordering::Greater
+            roles,
+            [
+                "client",
+                "server",
+                "curseforge",
+                "maven-pom",
+                "maven-metadata",
+                "release-notes"
+            ]
         );
+        let destinations = [
+            Destination::CurseForge,
+            Destination::GitHub,
+            Destination::Maven,
+            Destination::Modrinth,
+        ]
+        .map(|destination| serde_json::to_value(destination).expect("destination JSON"));
+        assert_eq!(destinations, ["curseforge", "github", "maven", "modrinth"]);
     }
 
     #[test]
@@ -1309,7 +1180,7 @@ author = "Example Author"
             release.changelog().expect("captured changelog"),
             "Original notes\n"
         );
-        let artifact = release.artifact(ArtifactKind::Modrinth).expect("mrpack");
+        let artifact = release.artifact(ArtifactKind::Client).expect("mrpack");
         let mut archive = zip::ZipArchive::new(Cursor::new(&artifact.bytes)).expect("mrpack zip");
         let mut index = String::new();
         archive
@@ -1408,7 +1279,7 @@ author = "Example Author"
         let metadata_path = root.dist_dir().join("maven-metadata.xml");
         fs::write(
             &metadata_path,
-            metadata_xml(
+            maven::metadata_xml(
                 "org.example.packs",
                 "example-pack",
                 "0.9.0",
@@ -1487,15 +1358,15 @@ author = "Example Author"
         assert_eq!(manifest.pack_version, "1.0.0");
         assert_eq!(manifest.preparation_mode, ReleasePreparation::Strict);
         assert!(manifest.artifacts.iter().any(|artifact| {
-            artifact.role == "client"
-                && artifact.destinations == ["github"]
+            artifact.role == ArtifactKind::Client
+                && artifact.destinations == [Destination::GitHub]
                 && artifact.media_type == "application/x-modrinth-modpack+zip"
                 && artifact.sha256.len() == 64
                 && artifact.sha512.len() == 128
         }));
         assert!(manifest.artifacts.iter().any(|artifact| {
-            artifact.role == "server"
-                && artifact.destinations == ["github"]
+            artifact.role == ArtifactKind::Server
+                && artifact.destinations == [Destination::GitHub]
                 && artifact.media_type == "application/x-modrinth-modpack+zip"
         }));
         assert_eq!(
@@ -1507,7 +1378,7 @@ author = "Example Author"
         let client = manifest
             .artifacts
             .iter()
-            .find(|artifact| artifact.role == "client")
+            .find(|artifact| artifact.role == ArtifactKind::Client)
             .expect("client artifact");
         fs::write(root.path.join(&client.path), b"changed").expect("change artifact");
         let error = verify_release(&root)
